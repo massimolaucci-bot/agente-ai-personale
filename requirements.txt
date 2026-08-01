@@ -1,4 +1,4 @@
 streamlit
 groq
-pinecone-client
-requests
+audio-recorder-streamlit
+gTTS
