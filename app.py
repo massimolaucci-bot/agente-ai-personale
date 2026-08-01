@@ -1,60 +1,84 @@
 import os
-import io
 import streamlit as st
 from groq import Groq
-from audio_recorder_streamlit import audio_recorder
-from gtts import gTTS
-import base64
 
-st.set_page_config(page_title="Agente AI Vocale", page_icon="🎙️")
-st.title("🎙️ Il tuo Agente AI Vocale")
+st.set_page_config(page_title="Agente AI Vocale", page_icon="🎙️", layout="centered")
+
+st.title("🎙️ Agente AI Vocale & Agentico")
 
 groq_api_key = os.environ.get("GROQ_API_KEY")
 
 if not groq_api_key:
-    st.warning("Inserisci la tua GROQ_API_KEY su Render.")
+    st.error("GROQ_API_KEY non trovata nelle impostazioni di Render.")
 else:
     client = Groq(api_key=groq_api_key)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Sezione registrazione audio
-    st.write("### 🗣️ Parla con l'Agente")
-    audio_bytes = audio_recorder(text="Clicca per registrare", recording_color="#e84c3d", neutral_color="#6aa84f")
+    # Pulsante Vocale Nativo Browser
+    st.write("### 🗣️ Interazione Vocale")
+    
+    components_code = """
+    <div style="text-align: center; margin-bottom: 20px;">
+        <button id="speech-btn" onclick="startDictation()" style="background-color: #ff4b4b; color: white; border: none; padding: 12px 24px; font-size: 16px; border-radius: 8px; cursor: pointer; font-weight: bold;">
+            🎤 Clicca qui per Parlare
+        </button>
+        <p id="status" style="margin-top: 10px; font-size: 14px; color: #666;"></p>
+    </div>
 
-    user_text = None
+    <script>
+        function startDictation() {
+            if (window.hasOwnProperty('webkitSpeechRecognition') || window.hasOwnProperty('SpeechRecognition')) {
+                var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                var recognition = new SpeechRecognition();
+                recognition.continuous = false;
+                recognition.interimResults = false;
+                recognition.lang = "it-IT";
+                
+                var btn = document.getElementById('speech-btn');
+                var status = document.getElementById('status');
+                
+                btn.style.backgroundColor = "#d32f2f";
+                status.innerText = "Ascolto in corso... parla ora!";
 
-    if audio_bytes:
-        with st.spinner("Trascrizione voce in corso..."):
-            audio_file = io.BytesIO(audio_bytes)
-            audio_file.name = "voice.wav"
-            try:
-                # Speech-To-Text con Whisper via Groq
-                transcription = client.audio.transcriptions.create(
-                    file=(audio_file.name, audio_file.read()),
-                    model="whisper-large-v3-turbo",
-                    language="it"
-                )
-                user_text = transcription.text
-            except Exception as e:
-                st.error(f"Errore trascrizione audio: {e}")
+                recognition.start();
 
-    # Fallback per input di testo
-    text_input = st.chat_input("Oppure scrivi qui...")
-    if text_input:
-        user_text = text_input
+                recognition.onresult = function(e) {
+                    var text = e.results[0][0].transcript;
+                    status.innerText = "Hai detto: " + text;
+                    btn.style.backgroundColor = "#ff4b4b";
+                    
+                    const chatInput = window.parent.document.querySelector('textarea[data-testid="stChatInputTextArea"]');
+                    if (chatInput) {
+                        chatInput.value = text;
+                        chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                };
 
-    # Mostra cronologia
+                recognition.onerror = function(e) {
+                    recognition.stop();
+                    btn.style.backgroundColor = "#ff4b4b";
+                    status.innerText = "Errore microfono o permesso negato.";
+                };
+            } else {
+                alert("Il tuo browser non supporta il riconoscimento vocale. Usa Google Chrome o Microsoft Edge.");
+            }
+        }
+    </script>
+    """
+    st.components.v1.html(components_code, height=100)
+
+    # Mostra la cronologia
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Elaborazione risposta
-    if user_text:
-        st.session_state.messages.append({"role": "user", "content": user_text})
+    # Input dell'utente
+    if prompt := st.chat_input("Chiedimi qualcosa o usa il pulsante sopra..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
-            st.markdown(user_text)
+            st.markdown(prompt)
 
         with st.chat_message("assistant"):
             try:
@@ -66,14 +90,15 @@ else:
                 st.markdown(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
 
-                # Generazione Audio Risposta (Text-To-Speech)
-                tts = gTTS(text=response, lang='it')
-                fp = io.BytesIO()
-                tts.write_to_fp(fp)
-                fp.seek(0)
-                audio_base64 = base64.b64encode(fp.read()).decode('utf-8')
-                audio_html = f'<audio autoplay src="data:audio/mp3;base64,{audio_base64}">'
-                st.components.v1.html(audio_html, height=0)
+                # Sintesi vocale automatica
+                tts_script = f"""
+                <script>
+                    var msg = new SpeechSynthesisUtterance({repr(response)});
+                    msg.lang = 'it-IT';
+                    window.speechSynthesis.speak(msg);
+                </script>
+                """
+                st.components.v1.html(tts_script, height=0)
 
             except Exception as e:
-                st.error(f"Errore: {e}")
+                st.error(f"Errore generazione: {e}")
