@@ -177,11 +177,22 @@ else:
                 'background:linear-gradient(90deg,#00e5ff,#7b5cff,#00e5ff);background-size:200% 100%;' +
                 'animation:carpanetWave 1.1s linear infinite;';
 
-            if (inputContainer) {
-                inputContainer.appendChild(micBtn);
-                if (inputContainer.parentElement) {
-                    inputContainer.parentElement.appendChild(indicator);
+            // La riga che contiene davvero la textarea e il pulsante di invio
+            // e' due livelli sopra la textarea stessa (row flessibile in orizzontale).
+            var row = chatInput.parentElement ? chatInput.parentElement.parentElement : null;
+            var submitBtn = doc.querySelector('[data-testid="stChatInputSubmitButton"]');
+            if (row) {
+                if (submitBtn && submitBtn.parentElement === row) {
+                    row.insertBefore(micBtn, submitBtn);
+                } else {
+                    row.appendChild(micBtn);
                 }
+            } else if (inputContainer) {
+                inputContainer.appendChild(micBtn);
+            }
+
+            if (inputContainer) {
+                inputContainer.appendChild(indicator);
             }
 
             function setListening(on) {
