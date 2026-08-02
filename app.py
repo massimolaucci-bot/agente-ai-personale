@@ -53,6 +53,7 @@ else:
                     if (chatInput) {
                         chatInput.value = text;
                         chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        chatInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
                     }
                 };
 
