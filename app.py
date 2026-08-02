@@ -189,10 +189,12 @@ st.markdown(f"""
     background: {GRADIENT_CSS};
     color: #e6f1ff;
 }}
-[data-testid="stHeader"] {{
+[data-testid="stHeader"],
+[data-testid="stHeader"] > div {{
     background: {GRADIENT_CSS} !important;
 }}
 [data-testid="stBottom"],
+[data-testid="stBottom"] > div,
 [data-testid="stBottomBlockContainer"] {{
     background: {GRADIENT_CSS} !important;
 }}
@@ -201,6 +203,9 @@ st.markdown(f"""
     border-radius: 24px !important;
     background: rgba(255,255,255,0.04) !important;
     align-items: center !important;
+}}
+[data-testid="stChatInput"] > div {{
+    background: transparent !important;
 }}
 [data-testid="stChatInput"] *,
 #carpanetMicBtn, #carpanetListeningBar {{
@@ -279,7 +284,13 @@ else:
         function fixBackgrounds(doc) {
             // Copre eventuali gap bianchi nell'header e nella barra inferiore fissa,
             // indipendentemente dai livelli di annidamento usati da Streamlit.
-            var selectors = ['[data-testid="stHeader"]', '[data-testid="stBottom"]', '[data-testid="stBottomBlockContainer"]'];
+            var selectors = [
+                '[data-testid="stHeader"]',
+                '[data-testid="stHeader"] > div',
+                '[data-testid="stBottom"]',
+                '[data-testid="stBottom"] > div',
+                '[data-testid="stBottomBlockContainer"]'
+            ];
             selectors.forEach(function(sel) {
                 var els = doc.querySelectorAll(sel);
                 els.forEach(function(el) {
