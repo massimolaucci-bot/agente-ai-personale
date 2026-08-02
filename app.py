@@ -83,7 +83,7 @@ else:
         with st.chat_message("assistant"):
             try:
                 completion = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model="groq/compound",
                     messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
                 )
                 response = completion.choices[0].message.content
