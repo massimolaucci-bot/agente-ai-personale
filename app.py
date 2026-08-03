@@ -334,6 +334,11 @@ st.markdown(f"""
 .stApp, [data-testid="stAppViewContainer"] {{
     color: #f2f6ff !important;
 }}
+[data-testid="stSidebar"],
+[data-testid="stSidebar"] > div,
+[data-testid="stSidebarContent"] {{
+    background: {GRADIENT_CSS} !important;
+}}
 [data-testid="stSidebar"] * {{
     color: #f2f6ff !important;
 }}
