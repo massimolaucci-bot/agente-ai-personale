@@ -323,17 +323,21 @@ st.markdown(f"""
 [data-testid="stChatInput"] button svg {{
     color: #e6f1ff !important;
 }}
-[data-testid="stChatInput"] button[aria-label="Start recording"],
+/* Il pulsante "Start recording" non riceve uno sfondo/border-radius forzato:
+   Streamlit sostituisce il suo contenuto con una visualizzazione audio (wavesurfer)
+   durante la registrazione, e un contenitore troppo vincolato dal nostro CSS
+   puo' interferire con quella libreria. Ci limitiamo a rendere l'icona ben visibile. */
+[data-testid="stChatInput"] button[aria-label="Start recording"] svg {{
+    color: #7b5cff !important;
+}}
 [data-testid="stChatInput"] button[aria-label="Upload files"] {{
     background: linear-gradient(135deg, #00e5ff, #7b5cff) !important;
     border-radius: 50% !important;
     opacity: 1 !important;
 }}
-[data-testid="stChatInput"] button[aria-label="Start recording"] svg,
 [data-testid="stChatInput"] button[aria-label="Upload files"] svg {{
     color: #0a0e17 !important;
 }}
-[data-testid="stChatInput"] button[aria-label="Start recording"] svg *,
 [data-testid="stChatInput"] button[aria-label="Upload files"] svg * {{
     fill: #0a0e17 !important;
     stroke: #0a0e17 !important;
