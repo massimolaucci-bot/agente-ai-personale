@@ -63,6 +63,7 @@ def _get_gdrive_client():
     Ritorna None se le credenziali non sono configurate o non sono valide."""
     global _gdrive_client
     if not _gdrive_enabled():
+        print("[Google Drive] Non configurato: manca GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_DRIVE_FOLDER_ID.")
         return None
     if _gdrive_client is not None:
         return _gdrive_client
@@ -75,7 +76,11 @@ def _get_gdrive_client():
         )
         _gdrive_client = build("drive", "v3", credentials=creds, cache_discovery=False)
         return _gdrive_client
-    except Exception:
+    except Exception as e:
+        # Log dell'errore reale nei log di Render (visibile su Dashboard > Logs), utile
+        # per capire la causa esatta (JSON malformato, credenziali non valide, ecc.)
+        # invece del generico "non configurato o non raggiungibile" mostrato in chat.
+        print(f"[Google Drive] ERRORE creazione client: {type(e).__name__}: {e}")
         _gdrive_client = None
         return None
 
@@ -99,7 +104,8 @@ def gdrive_upload(file_bytes, filename):
             body=metadata, media_body=media, fields="id, webViewLink"
         ).execute()
         return created.get("webViewLink") or created.get("id")
-    except Exception:
+    except Exception as e:
+        print(f"[Google Drive] ERRORE durante il caricamento di '{filename}': {type(e).__name__}: {e}")
         return None
 
 
