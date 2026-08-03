@@ -321,6 +321,23 @@ st.markdown(f"""
     opacity: 1 !important;
 }}
 [data-testid="stChatInput"] button svg {{
+    color: #e6f1ff !important;
+}}
+[data-testid="stChatInput"] button[aria-label="Start recording"],
+[data-testid="stChatInput"] button[aria-label="Upload files"] {{
+    background: linear-gradient(135deg, #00e5ff, #7b5cff) !important;
+    border-radius: 50% !important;
+    opacity: 1 !important;
+}}
+[data-testid="stChatInput"] button[aria-label="Start recording"] svg,
+[data-testid="stChatInput"] button[aria-label="Upload files"] svg {{
+    color: #0a0e17 !important;
+}}
+[data-testid="stChatInput"] button[aria-label="Send message"] {{
+    background: linear-gradient(135deg, #00e5ff, #7b5cff) !important;
+    border-radius: 50% !important;
+}}
+[data-testid="stChatInput"] button[aria-label="Send message"] svg {{
     color: #0a0e17 !important;
 }}
 .stApp, [data-testid="stAppViewContainer"] {{
