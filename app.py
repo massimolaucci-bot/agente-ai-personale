@@ -932,6 +932,13 @@ else:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    if not st.session_state.messages:
+        st.caption(
+            "🎙️ Se il microfono mostra \"Recording failed\" o non registra, il browser ha "
+            "probabilmente bloccato il permesso in passato: tocca l'icona del lucchetto/informazioni "
+            "accanto all'indirizzo del sito, apri i permessi e consenti il Microfono, poi ricarica la pagina."
+        )
+
     user_input = st.chat_input(
         "Chiedimi qualcosa, usa il microfono o allega un file...",
         accept_file="multiple",
