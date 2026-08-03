@@ -312,20 +312,6 @@ st.markdown(f"""
 [data-testid="stChatInput"] > div {{
     background: transparent !important;
 }}
-[data-testid="stChatInput"] *,
-#carpanetMicBtn, #carpanetListeningBar {{
-    -webkit-user-select: none !important;
-    user-select: none !important;
-    -webkit-touch-callout: none !important;
-    -webkit-user-drag: none !important;
-    touch-action: manipulation !important;
-}}
-#carpanetMicBtn {{
-    touch-action: none !important;
-    position: relative !important;
-    z-index: 5 !important;
-    -webkit-tap-highlight-color: transparent !important;
-}}
 [data-testid="stChatInputTextArea"] {{
     color: #f2f6ff !important;
     font-size: 1rem !important;
@@ -523,212 +509,58 @@ else:
     if "knowledge_text" not in st.session_state:
         st.session_state.knowledge_text = load_knowledge()
 
-    voice_html = """
-    <script>
-    (function() {
-        var GRADIENT = 'linear-gradient(135deg, #0a0e17 0%, #10162a 100%)';
-
-        function vibrate(ms) {
-            try {
-                if (window.parent.navigator && window.parent.navigator.vibrate) {
-                    window.parent.navigator.vibrate(ms);
-                }
-            } catch (e) {}
-        }
-
-        function fixBackgrounds(doc) {
-            // Copre eventuali gap bianchi nell'header e nella barra inferiore fissa,
-            // indipendentemente dai livelli di annidamento usati da Streamlit.
-            var selectors = [
-                '[data-testid="stHeader"]',
-                '[data-testid="stHeader"] > div',
-                '[data-testid="stBottom"]',
-                '[data-testid="stBottom"] > div',
-                '[data-testid="stBottomBlockContainer"]'
-            ];
-            selectors.forEach(function(sel) {
-                var els = doc.querySelectorAll(sel);
-                els.forEach(function(el) {
-                    el.style.setProperty('background', GRADIENT, 'important');
-                });
-            });
-        }
-
-        function injectVoiceUI() {
-            var doc = window.parent.document;
-            var chatInput = doc.querySelector('textarea[data-testid="stChatInputTextArea"]');
-            if (!chatInput) { return false; }
-
-            fixBackgrounds(doc);
-
-            if (doc.getElementById('carpanetMicBtn')) { return true; }
-
-            var inputContainer = chatInput.closest('[data-testid="stChatInput"]') || chatInput.parentElement;
-
-            var micBtn = doc.createElement('button');
-            micBtn.id = 'carpanetMicBtn';
-            micBtn.type = 'button';
-            micBtn.setAttribute('aria-label', 'Parla');
-            micBtn.setAttribute('oncontextmenu', 'return false');
-            micBtn.innerHTML =
-                '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="pointer-events:none;">' +
-                '<path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" fill="#0a0e17"/>' +
-                '<path d="M19 11a7 7 0 0 1-14 0M12 18v3" stroke="#0a0e17" stroke-width="2" stroke-linecap="round" fill="none"/>' +
-                '</svg>';
-            micBtn.setAttribute('draggable', 'false');
-            micBtn.style.cssText =
-                'width:46px;height:46px;min-width:46px;border-radius:50%;border:none;' +
-                'background:linear-gradient(135deg,#00e5ff,#7b5cff);color:#0a0e17;' +
-                'cursor:pointer;display:flex;align-items:center;justify-content:center;' +
-                'margin:4px 6px;flex-shrink:0;-webkit-tap-highlight-color:transparent;' +
-                'touch-action:none;-webkit-user-drag:none;position:relative;z-index:5;';
-
-            // Blocca il gesto nativo (long-press/selezione/drag) il prima possibile,
-            // intercettando sia i touch event che i pointer event, prima che il
-            // browser possa avviare selezione testo o menu contestuale.
-            ['touchstart', 'pointerdown', 'selectstart'].forEach(function(evtName) {
-                micBtn.addEventListener(evtName, function(e) {
-                    e.preventDefault();
-                    if (e.stopPropagation) e.stopPropagation();
-                }, { passive: false });
-            });
-            micBtn.addEventListener('contextmenu', function(e) {
-                e.preventDefault();
-            });
-
-            var indicator = doc.createElement('div');
-            indicator.id = 'carpanetListeningBar';
-            indicator.style.cssText =
-                'display:none;height:4px;border-radius:4px;margin:4px 12px 8px 12px;' +
-                'background:linear-gradient(90deg,#00e5ff,#7b5cff,#00e5ff);background-size:200% 100%;' +
-                'animation:carpanetWave 1.1s linear infinite;';
-
-            var styleTag = doc.createElement('style');
-            styleTag.innerHTML =
-                '@keyframes carpanetWave { 0% { background-position: 0% 0; } 100% { background-position: 200% 0; } }';
-            doc.head.appendChild(styleTag);
-
-            // La riga che contiene davvero la textarea e il pulsante di invio
-            // e' due livelli sopra la textarea stessa (row flessibile in orizzontale).
-            var row = chatInput.parentElement ? chatInput.parentElement.parentElement : null;
-            var submitBtn = doc.querySelector('[data-testid="stChatInputSubmitButton"]');
-            if (row) {
-                if (submitBtn && submitBtn.parentElement === row) {
-                    row.insertBefore(micBtn, submitBtn);
-                    // Vibrazione anche sul pulsante di invio nativo, come gli altri tasti
-                    if (!submitBtn.dataset.carpanetVibrate) {
-                        submitBtn.dataset.carpanetVibrate = '1';
-                        submitBtn.addEventListener('click', function() { vibrate(20); });
-                    }
-                } else {
-                    row.appendChild(micBtn);
-                }
-            } else if (inputContainer) {
-                inputContainer.appendChild(micBtn);
-            }
-
-            if (inputContainer) {
-                inputContainer.appendChild(indicator);
-            }
-
-            function setListening(on) {
-                indicator.style.display = on ? 'block' : 'none';
-                micBtn.style.boxShadow = on ? '0 0 12px rgba(0,229,255,0.9)' : 'none';
-            }
-
-            micBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                vibrate(30);
-                var w = window.parent;
-                if (!('webkitSpeechRecognition' in w) && !('SpeechRecognition' in w)) {
-                    alert('Il tuo browser non supporta il riconoscimento vocale. Usa Google Chrome su Android.');
-                    return;
-                }
-                var SpeechRecognition = w.SpeechRecognition || w.webkitSpeechRecognition;
-                var recognition = new SpeechRecognition();
-                recognition.lang = 'it-IT';
-                recognition.continuous = false;
-                recognition.interimResults = false;
-
-                setListening(true);
-                recognition.start();
-
-                recognition.onresult = function(ev) {
-                    var text = ev.results[0][0].transcript;
-                    var nativeSetter = Object.getOwnPropertyDescriptor(w.HTMLTextAreaElement.prototype, 'value').set;
-                    nativeSetter.call(chatInput, text);
-                    chatInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    chatInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-                };
-                recognition.onerror = function() { recognition.stop(); };
-                recognition.onend = function() { setListening(false); };
-            });
-
-            return true;
-        }
-
-        var attempts = 0;
-        var interval = setInterval(function() {
-            attempts++;
-            var ready = injectVoiceUI();
-            if (attempts > 60) {
-                clearInterval(interval);
-            }
-        }, 300);
-    })();
-    </script>
-    """
-    st.components.v1.html(voice_html, height=0)
+    # Nota tecnica: Streamlit 1.60 supporta nativamente allegati (accept_file) e
+    # registrazione vocale (accept_audio) direttamente dentro st.chat_input, con
+    # gestione touch/mobile curata dal team di Streamlit stesso. Usiamo questa
+    # funzione nativa invece di ricostruire microfono/allegati a mano via
+    # JavaScript: e' il fix definitivo al problema di selezione touch, perche
+    # non c'e piu nessun elemento "estraneo" iniettato dentro la barra di input
+    # che possa entrare in conflitto con i controlli nativi del browser.
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    with st.popover("📎 Allega foto, video o file"):
-        st.caption("Scegli cosa allegare al prossimo messaggio")
-        attach_kind = st.radio(
-            "Tipo di allegato",
-            ["Foto dalla galleria", "Scatta una foto", "Video", "File generico"],
-            label_visibility="collapsed",
-            key="attach_kind",
-        )
-        uploaded_file = None
-        if attach_kind == "Scatta una foto":
-            uploaded_file = st.camera_input("Scatta una foto", key="attach_camera")
-        elif attach_kind == "Foto dalla galleria":
-            uploaded_file = st.file_uploader("Scegli una foto", type=["png", "jpg", "jpeg", "heic", "webp"], key="attach_gallery")
-        elif attach_kind == "Video":
-            uploaded_file = st.file_uploader("Scegli un video", type=["mp4", "mov", "avi", "webm"], key="attach_video")
-        else:
-            uploaded_file = st.file_uploader("Scegli un file", key="attach_file")
+    user_input = st.chat_input(
+        "Chiedimi qualcosa, usa il microfono o allega un file...",
+        accept_file="multiple",
+        file_type=["png", "jpg", "jpeg", "heic", "webp", "mp4", "mov", "avi", "webm", "pdf", "doc", "docx", "txt"],
+        accept_audio=True,
+        audio_sample_rate=16000,
+    )
 
-        if uploaded_file is not None:
-            st.session_state.pending_attachment = uploaded_file
-            st.success(f"Pronto per l'invio: {uploaded_file.name}")
+    if user_input:
+        prompt = (user_input.text or "").strip()
+        notes = []
 
-    if st.session_state.get("pending_attachment") is not None:
-        col_a, col_b = st.columns([4, 1])
-        with col_a:
-            st.caption(f"📎 Allegato pronto: {st.session_state.pending_attachment.name} — verra inviato con il prossimo messaggio.")
-        with col_b:
-            if st.button("Rimuovi", key="remove_attachment"):
-                st.session_state.pending_attachment = None
-                st.rerun()
+        if user_input.audio is not None:
+            try:
+                transcription = client.audio.transcriptions.create(
+                    model="whisper-large-v3",
+                    file=("audio.wav", user_input.audio.getvalue()),
+                    language="it",
+                )
+                transcribed = (transcription.text or "").strip()
+                if transcribed:
+                    prompt = (prompt + " " + transcribed).strip() if prompt else transcribed
+            except Exception:
+                notes.append("[Audio ricevuto ma non e stato possibile trascriverlo]")
 
-    if prompt := st.chat_input("Chiedimi qualcosa o usa il microfono accanto al campo..."):
-        attachment_note = ""
-        attachment = st.session_state.get("pending_attachment")
-        if attachment is not None:
-            file_bytes = attachment.getvalue()
-            fileid = pcloud_upload(file_bytes, attachment.name)
+        for f in (user_input.files or []):
+            file_bytes = f.getvalue()
+            fileid = pcloud_upload(file_bytes, f.name)
             if fileid is not None:
-                attachment_note = f"\n\n[Allegato salvato su pCloud: {attachment.name}]"
+                notes.append(f"[Allegato salvato su pCloud: {f.name}]")
             else:
-                attachment_note = f"\n\n[Allegato ricevuto: {attachment.name} — non salvato in modo permanente perche pCloud non e ancora configurato o non e raggiungibile]"
-            st.session_state.pending_attachment = None
+                notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche pCloud non e ancora configurato o non e raggiungibile]")
 
-        prompt = prompt + attachment_note
+        if notes:
+            prompt = (prompt + "\n\n" + "\n".join(notes)).strip() if prompt else "\n".join(notes)
+
+    else:
+        prompt = None
+
+    if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
         save_memory(st.session_state.messages)
         with st.chat_message("user"):
