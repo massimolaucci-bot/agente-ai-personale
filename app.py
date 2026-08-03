@@ -320,38 +320,16 @@ st.markdown(f"""
     color: #a9b8d6 !important;
     opacity: 1 !important;
 }}
-[data-testid="stChatInput"] button svg {{
-    color: #e6f1ff !important;
-}}
-/* Il pulsante "Start recording" non riceve uno sfondo/border-radius forzato:
-   Streamlit sostituisce il suo contenuto con una visualizzazione audio (wavesurfer)
-   durante la registrazione, e un contenitore troppo vincolato dal nostro CSS
-   puo' interferire con quella libreria. Ci limitiamo a rendere l'icona ben visibile. */
-[data-testid="stChatInput"] button[aria-label="Start recording"] svg {{
-    color: #7b5cff !important;
-}}
-[data-testid="stChatInput"] button[aria-label="Upload files"] {{
-    background: linear-gradient(135deg, #00e5ff, #7b5cff) !important;
-    border-radius: 50% !important;
+/* Icone native di st.chat_input (allega file, microfono, invia):
+   NON forziamo background, border-radius, fill o stroke sugli SVG.
+   Streamlit gestisce internamente lo stato di questi pulsanti (inclusa la
+   visualizzazione audio "wavesurfer" durante la registrazione) e un CSS
+   troppo invasivo su di essi rompe sia il contenitore della registrazione
+   sia il disegno dell'icona stessa (icone diventate blocchi pieni).
+   Le icone native sono gia' chiare su sfondo scuro e ben leggibili;
+   ci limitiamo a un lieve aumento di opacita' per sicurezza. */
+[data-testid="stChatInput"] button {{
     opacity: 1 !important;
-}}
-[data-testid="stChatInput"] button[aria-label="Upload files"] svg {{
-    color: #0a0e17 !important;
-}}
-[data-testid="stChatInput"] button[aria-label="Upload files"] svg * {{
-    fill: #0a0e17 !important;
-    stroke: #0a0e17 !important;
-}}
-[data-testid="stChatInput"] button[aria-label="Send message"] {{
-    background: linear-gradient(135deg, #00e5ff, #7b5cff) !important;
-    border-radius: 50% !important;
-}}
-[data-testid="stChatInput"] button[aria-label="Send message"] svg {{
-    color: #0a0e17 !important;
-}}
-[data-testid="stChatInput"] button[aria-label="Send message"] svg * {{
-    fill: #0a0e17 !important;
-    stroke: #0a0e17 !important;
 }}
 .stApp, [data-testid="stAppViewContainer"] {{
     color: #f2f6ff !important;
