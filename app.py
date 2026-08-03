@@ -607,7 +607,61 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
     return api_messages
 
 
-st.set_page_config(page_title="Carpanet AI", page_icon=":fish:", layout="centered")
+st.set_page_config(page_title="Carpanet AI", page_icon="static/icon-192.png", layout="centered")
+
+# --- PWA: installazione come app sulla schermata Home -----------------------
+# Inietta nel <head> reale della pagina (non in un iframe: st.markdown con
+# unsafe_allow_html finisce nel documento principale, esattamente come il CSS
+# sottostante) il collegamento al manifest, le icone per iOS/Android, i meta
+# tag "app installabile" e la registrazione del service worker. Il controllo
+# "se non gia' presente" evita di duplicare i tag ad ogni rerun di Streamlit.
+st.markdown("""
+<script>
+(function() {
+    var head = window.parent ? window.parent.document.head : document.head;
+    var doc = window.parent ? window.parent.document : document;
+    if (head.querySelector('link[rel="manifest"]')) { return; }
+
+    function addTag(tag, attrs) {
+        var el = doc.createElement(tag);
+        for (var k in attrs) { el.setAttribute(k, attrs[k]); }
+        head.appendChild(el);
+        return el;
+    }
+
+    addTag('link', {rel: 'manifest', href: '/app/static/manifest.json'});
+    addTag('link', {rel: 'apple-touch-icon', href: '/app/static/apple-touch-icon.png'});
+    addTag('link', {rel: 'icon', type: 'image/png', sizes: '32x32', href: '/app/static/favicon-32.png'});
+    addTag('link', {rel: 'icon', type: 'image/png', sizes: '16x16', href: '/app/static/favicon-16.png'});
+    addTag('meta', {name: 'theme-color', content: '#0a0e17'});
+    addTag('meta', {name: 'mobile-web-app-capable', content: 'yes'});
+    addTag('meta', {name: 'apple-mobile-web-app-capable', content: 'yes'});
+    addTag('meta', {name: 'apple-mobile-web-app-title', content: 'Carpanet AI'});
+    // "default" (non "black-translucent"): il contenuto NON disegna sotto la
+    // barra di stato del telefono, che resta separata e opaca. E' la scelta
+    // che evita che l'orologio del telefono finisca sovrapposto alla barra
+    // scura dell'app una volta installata come icona sulla Home.
+    addTag('meta', {name: 'apple-mobile-web-app-status-bar-style', content: 'default'});
+
+    // Il tag <meta name="viewport"> e' gia' presente (lo imposta Streamlit):
+    // lo aggiorniamo per includere viewport-fit=cover, necessario perche' il
+    // padding di sicurezza (safe-area-inset) qui sotto funzioni davvero.
+    var vp = head.querySelector('meta[name="viewport"]');
+    if (vp) {
+        var content = vp.getAttribute('content') || '';
+        if (content.indexOf('viewport-fit') === -1) {
+            vp.setAttribute('content', content + ', viewport-fit=cover');
+        }
+    } else {
+        addTag('meta', {name: 'viewport', content: 'width=device-width, initial-scale=1, viewport-fit=cover'});
+    }
+
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/app/static/sw.js').catch(function() {});
+    }
+})();
+</script>
+""", unsafe_allow_html=True)
 
 GRADIENT_CSS = "linear-gradient(135deg, #0a0e17 0%, #10162a 100%)"
 
@@ -620,6 +674,19 @@ st.markdown(f"""
 [data-testid="stHeader"],
 [data-testid="stHeader"] > div {{
     background: {GRADIENT_CSS} !important;
+}}
+/* Spazio di sicurezza per la barra di stato del telefono (notch, isola
+   dinamica, orologio) quando l'app e' installata come PWA a schermo intero:
+   senza questo padding, sui telefoni con display "edge-to-edge" il contenuto
+   puo' finire disegnato proprio sotto l'orario di sistema, facendolo sembrare
+   "incollato" sopra la barra colorata dell'app. env(...) vale 0 su schermi
+   senza notch/safe-area, quindi qui non cambia nulla in quel caso. */
+html, body {{
+    padding-top: env(safe-area-inset-top) !important;
+}}
+[data-testid="stHeader"] {{
+    padding-top: env(safe-area-inset-top) !important;
+    height: calc(3.5rem + env(safe-area-inset-top)) !important;
 }}
 [data-testid="stBottom"],
 [data-testid="stBottom"] > div,
@@ -831,7 +898,7 @@ if "current_user" not in st.session_state:
     st.session_state.current_user = None
 
 if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
-    st.markdown("## 👨‍👩‍👧‍👦 Accesso famiglia")
+    st.markdown("## AI privata")
     existing_users = _load_family_users()
     if not existing_users:
         st.info("Nessun account ancora creato. Crea il primo account (genitore) per iniziare.")
