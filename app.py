@@ -38,65 +38,66 @@ def _supabase_enabled():
     return SUPABASE_HEADERS is not None
 
 
-# --- Mega (allegati: foto, video, documenti) ----------------------------------
-# Configurazione via variabili d'ambiente su Render: MEGA_EMAIL e MEGA_PASSWORD
-# (le credenziali del tuo account Mega, mai gestite da Claude: le imposti tu
-# direttamente su Render). Cartella opzionale: MEGA_FOLDER_NAME (se non impostata,
-# i file vengono caricati nella root del tuo Mega).
-MEGA_EMAIL = os.environ.get("MEGA_EMAIL")
-MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
-MEGA_FOLDER_NAME = os.environ.get("MEGA_FOLDER_NAME")
+# --- Google Drive (allegati: foto, video, documenti) --------------------------
+# Usa un Service Account Google (niente login OAuth interattivo, niente token che
+# scadono da rinnovare a mano). Configurazione via variabili d'ambiente su Render:
+# - GOOGLE_SERVICE_ACCOUNT_JSON: il contenuto INTERO del file JSON della chiave del
+#   service account (creato dalla Google Cloud Console), incollato come testo.
+# - GOOGLE_DRIVE_FOLDER_ID: l'ID della cartella nel tuo Google Drive che hai
+#   condiviso con l'email del service account (dando permesso "Editor"): e' li
+#   che finiscono gli allegati, e occupano lo spazio del TUO account, non quello
+#   (nullo) del service account.
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
 
-_mega_client = None
-_mega_folder_node = None
-
-
-def _mega_enabled():
-    return bool(MEGA_EMAIL and MEGA_PASSWORD)
+_gdrive_client = None
 
 
-def _get_mega_client():
-    """Crea (una sola volta per processo) e ritorna il client Mega gia' loggato.
-    Ritorna None se le credenziali non sono configurate o il login fallisce."""
-    global _mega_client
-    if not _mega_enabled():
+def _gdrive_enabled():
+    return bool(GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_DRIVE_FOLDER_ID)
+
+
+def _get_gdrive_client():
+    """Crea (una sola volta per processo) e ritorna il client Google Drive.
+    Ritorna None se le credenziali non sono configurate o non sono valide."""
+    global _gdrive_client
+    if not _gdrive_enabled():
         return None
-    if _mega_client is not None:
-        return _mega_client
+    if _gdrive_client is not None:
+        return _gdrive_client
     try:
-        from mega import Mega
-        _mega_client = Mega().login(MEGA_EMAIL, MEGA_PASSWORD)
-        return _mega_client
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        _gdrive_client = build("drive", "v3", credentials=creds, cache_discovery=False)
+        return _gdrive_client
     except Exception:
-        _mega_client = None
+        _gdrive_client = None
         return None
 
 
-def mega_upload(file_bytes, filename):
-    """Carica un file su Mega. Ritorna un link di condivisione se riuscito, altrimenti None.
-    Non solleva mai eccezioni: se Mega non e configurato o la chiamata fallisce,
-    l'app deve continuare a funzionare comunque (allegato semplicemente non salvato)."""
-    m = _get_mega_client()
-    if m is None:
+def gdrive_upload(file_bytes, filename):
+    """Carica un file su Google Drive (nella cartella condivisa). Ritorna un link
+    al file se riuscito, altrimenti None. Non solleva mai eccezioni: se Google Drive
+    non e configurato o la chiamata fallisce, l'app deve continuare a funzionare
+    comunque (allegato semplicemente non salvato)."""
+    service = _get_gdrive_client()
+    if service is None:
         return None
     try:
-        import tempfile
-        suffix = "_" + filename
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-        try:
-            global _mega_folder_node
-            dest_node = None
-            if MEGA_FOLDER_NAME:
-                if _mega_folder_node is None:
-                    found = m.find(MEGA_FOLDER_NAME)
-                    _mega_folder_node = found[0] if found else m.create_folder(MEGA_FOLDER_NAME)
-                dest_node = _mega_folder_node
-            uploaded = m.upload(tmp_path, dest_node) if dest_node else m.upload(tmp_path)
-            return m.get_upload_link(uploaded)
-        finally:
-            os.remove(tmp_path)
+        import io
+        import mimetypes
+        from googleapiclient.http import MediaIoBaseUpload
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+        metadata = {"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
+        created = service.files().create(
+            body=metadata, media_body=media, fields="id, webViewLink"
+        ).execute()
+        return created.get("webViewLink") or created.get("id")
     except Exception:
         return None
 
@@ -517,12 +518,12 @@ with st.sidebar:
             st.caption("I grafici dettagliati richiedono la memoria persistente su database (Supabase), attualmente attiva. Se non e raggiungibile, qui non vedrai dati.")
 
     st.markdown("---")
-    st.markdown("#### 📎 Allegati (Mega)")
-    ALLEGATI_ATTIVI = _mega_enabled()
+    st.markdown("#### 📎 Allegati (Google Drive)")
+    ALLEGATI_ATTIVI = _gdrive_enabled()
     if ALLEGATI_ATTIVI:
-        st.caption("Gli allegati inviati dalla chat vengono salvati su Mega.")
+        st.caption("Gli allegati inviati dalla chat vengono salvati su Google Drive.")
     else:
-        st.caption("Il salvataggio su Mega non e ancora configurato: gli allegati verranno comunque accettati ma non salvati in modo permanente, finche non vengono aggiunte le credenziali Mega.")
+        st.caption("Il salvataggio su Google Drive non e ancora configurato: gli allegati verranno comunque accettati ma non salvati in modo permanente, finche non vengono aggiunte le credenziali Google Drive.")
 
     if IS_PARENT and MEMORIA_PERSISTENTE:
         st.markdown("---")
@@ -598,11 +599,11 @@ else:
 
         for f in (user_input.files or []):
             file_bytes = f.getvalue()
-            mega_link = mega_upload(file_bytes, f.name)
-            if mega_link is not None:
-                notes.append(f"[Allegato salvato su Mega: {f.name} ({mega_link})]")
+            gdrive_link = gdrive_upload(file_bytes, f.name)
+            if gdrive_link is not None:
+                notes.append(f"[Allegato salvato su Google Drive: {f.name} ({gdrive_link})]")
             else:
-                notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche Mega non e ancora configurato o non e raggiungibile]")
+                notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche Google Drive non e ancora configurato o non e raggiungibile]")
 
         if notes:
             prompt = (prompt + "\n\n" + "\n".join(notes)).strip() if prompt else "\n".join(notes)
