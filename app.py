@@ -333,12 +333,21 @@ st.markdown(f"""
 [data-testid="stChatInput"] button[aria-label="Upload files"] svg {{
     color: #0a0e17 !important;
 }}
+[data-testid="stChatInput"] button[aria-label="Start recording"] svg *,
+[data-testid="stChatInput"] button[aria-label="Upload files"] svg * {{
+    fill: #0a0e17 !important;
+    stroke: #0a0e17 !important;
+}}
 [data-testid="stChatInput"] button[aria-label="Send message"] {{
     background: linear-gradient(135deg, #00e5ff, #7b5cff) !important;
     border-radius: 50% !important;
 }}
 [data-testid="stChatInput"] button[aria-label="Send message"] svg {{
     color: #0a0e17 !important;
+}}
+[data-testid="stChatInput"] button[aria-label="Send message"] svg * {{
+    fill: #0a0e17 !important;
+    stroke: #0a0e17 !important;
 }}
 .stApp, [data-testid="stAppViewContainer"] {{
     color: #f2f6ff !important;
