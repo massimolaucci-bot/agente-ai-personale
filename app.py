@@ -5,6 +5,7 @@ import requests
 import streamlit as st
 from groq import Groq
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 MEMORY_FILE = "chat_memory.json"
 KNOWLEDGE_FILE = "knowledge.json"
@@ -228,14 +229,67 @@ def _hash_pin(pin):
     return hashlib.sha256((str(pin) + "carpanet_family_salt_v1").encode("utf-8")).hexdigest()
 
 
+_GIORNI_IT = ["lunedi", "martedi", "mercoledi", "giovedi", "venerdi", "sabato", "domenica"]
+_MESI_IT = [
+    "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+    "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre",
+]
+
+
+def _adesso_roma():
+    """Ora corrente nel fuso di Roma. Il server (Render) gira in UTC, quindi senza
+    questa conversione esplicita saluti e data/ora sarebbero sbagliati per buona
+    parte della giornata."""
+    try:
+        return datetime.now(ZoneInfo("Europe/Rome"))
+    except Exception:
+        return datetime.now()
+
+
 def _saluto_orario():
-    ora = datetime.now().hour
+    ora = _adesso_roma().hour
     if ora < 12:
         return "buongiorno"
     elif ora < 18:
         return "buon pomeriggio"
     else:
         return "buonasera"
+
+
+def _contesto_temporale():
+    """Stringa con data, giorno della settimana e ora correnti (fuso Europe/Rome),
+    da inserire nel system prompt: il modello altrimenti non ha alcun modo di
+    sapere che giorno o che ora sia."""
+    now = _adesso_roma()
+    giorno = _GIORNI_IT[now.weekday()]
+    mese = _MESI_IT[now.month - 1]
+    return (
+        f"Oggi e {giorno} {now.day} {mese} {now.year}, sono le {now.strftime('%H:%M')} "
+        f"(ora italiana, fuso orario Europe/Rome)."
+    )
+
+
+def _reverse_geocode(lat, lon):
+    """Trasforma coordinate GPS in un nome di luogo leggibile (citta, paese) usando
+    il servizio gratuito e senza chiave OpenStreetMap Nominatim. Nessuna nuova
+    dipendenza pip: usa 'requests', gia presente. Non solleva mai eccezioni."""
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"format": "json", "lat": lat, "lon": lon, "zoom": 10, "addressdetails": 1},
+            headers={"User-Agent": "CarpanetAI-uso-personale/1.0"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        addr = data.get("address", {})
+        citta = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("county")
+        paese = addr.get("country")
+        if citta and paese:
+            return f"{citta}, {paese}"
+        return data.get("display_name")
+    except Exception:
+        return None
 
 
 def _load_family_users():
@@ -289,7 +343,7 @@ def _create_family_user(name, pin, role):
         return False
 
 
-def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None):
+def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None, location_text=None):
     history_limit = history_limit or MAX_HISTORY_MESSAGES
     char_limit = char_limit or MAX_MESSAGE_CHARS
 
@@ -297,8 +351,11 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "Sei Carpanet AI, l'assistente personale di Massimo (Carpanet). "
         "Rispondi sempre in italiano, in modo chiaro, utile e diretto. "
         "Per default sii conciso: vai dritto al punto e approfondisci solo se l'utente lo chiede esplicitamente "
-        "(es. 'spiegami meglio', 'in dettaglio', 'più lungo')."
+        "(es. 'spiegami meglio', 'in dettaglio', 'più lungo').\n\n"
+        f"{_contesto_temporale()}"
     )
+    if location_text:
+        system_prompt += f"\nPosizione approssimativa dell'utente: {location_text}."
     if knowledge_text and knowledge_text.strip():
         system_prompt += (
             "\n\nInformazioni e istruzioni permanenti fornite dall'utente: seguile sempre.\n"
@@ -345,7 +402,7 @@ st.markdown(f"""
 }}
 [data-testid="stChatInputTextArea"] {{
     color: #f2f6ff !important;
-    font-size: 1rem !important;
+    font-size: 1.05rem !important;
 }}
 [data-testid="stChatInputTextArea"]::placeholder {{
     color: #a9b8d6 !important;
@@ -361,6 +418,26 @@ st.markdown(f"""
    ci limitiamo a un lieve aumento di opacita' per sicurezza. */
 [data-testid="stChatInput"] button {{
     opacity: 1 !important;
+    cursor: pointer !important;
+    pointer-events: auto !important;
+}}
+/* Pulsante "Start recording" (microfono): stile blu neon SOLO tramite
+   color/filter (mai background, border-radius o dimensioni), esattamente
+   come richiesto, per non rompere la visualizzazione "wavesurfer" della
+   registrazione, gia' rotta in passato da CSS troppo invasivo su questo
+   pulsante specifico. */
+[data-testid="stChatInputMicButton"] {{
+    color: #00e5ff !important;
+    cursor: pointer !important;
+    pointer-events: auto !important;
+    filter: drop-shadow(0 0 5px rgba(0, 229, 255, 0.85));
+}}
+[data-testid="stChatInputMicButton"]:hover {{
+    filter: drop-shadow(0 0 9px rgba(0, 229, 255, 1));
+}}
+[data-testid="stChatInputMicButton"][disabled] {{
+    color: #5a6b8c !important;
+    filter: none;
 }}
 .stApp, [data-testid="stAppViewContainer"] {{
     color: #f2f6ff !important;
@@ -382,11 +459,133 @@ st.markdown(f"""
     max-width: 320px;
     width: 100%;
 }}
+
+/* --- Chat in stile "Claude": testo piu grande, spaziatura generosa, ------- */
+/* --- avatar colorati, colonna di lettura piu ampia e leggibile ----------- */
+.block-container {{
+    max-width: 820px !important;
+    padding-top: 1.5rem !important;
+}}
+[data-testid="stChatMessage"] {{
+    padding: 1.35rem 0 !important;
+    gap: 1rem !important;
+    align-items: flex-start !important;
+}}
+[data-testid="stChatMessageContent"] {{
+    font-size: 1.15rem !important;
+    line-height: 1.75 !important;
+}}
+[data-testid="stChatMessageContent"] p,
+[data-testid="stChatMessageContent"] li {{
+    font-size: 1.15rem !important;
+    line-height: 1.75 !important;
+    margin-bottom: 0.6rem !important;
+}}
+[data-testid="stChatMessageAvatarUser"] {{
+    background: linear-gradient(135deg, #00e5ff, #2b6cff) !important;
+    color: #08111f !important;
+}}
+[data-testid="stChatMessageAvatarAssistant"] {{
+    background: linear-gradient(135deg, #7c5cff, #00e5ff) !important;
+    color: #08111f !important;
+}}
+
+/* --- Pagina di benvenuto dopo il login ------------------------------------ */
+.carpanet-welcome {{
+    text-align: center;
+    padding: 2.5rem 1rem 1rem 1rem;
+}}
+.carpanet-welcome-logo {{
+    display: block;
+    margin: 0 auto 1.25rem auto;
+    max-width: 180px;
+    width: 55%;
+}}
+.carpanet-welcome h1 {{
+    font-size: 2.1rem;
+    margin-bottom: 0.4rem;
+}}
+.carpanet-welcome-sub {{
+    font-size: 1.15rem;
+    color: #b9c6e6;
+}}
+
+/* --- Adattamento responsive: telefono / tablet / PC ----------------------- */
+@media (max-width: 640px) {{
+    .block-container {{ padding-left: 0.75rem !important; padding-right: 0.75rem !important; }}
+    [data-testid="stChatMessageContent"],
+    [data-testid="stChatMessageContent"] p,
+    [data-testid="stChatMessageContent"] li {{
+        font-size: 1.05rem !important;
+        line-height: 1.65 !important;
+    }}
+    .carpanet-welcome h1 {{ font-size: 1.6rem; }}
+    .carpanet-welcome-sub {{ font-size: 1rem; }}
+    .carpanet-logo, .carpanet-welcome-logo {{ max-width: 130px; }}
+}}
+@media (min-width: 641px) and (max-width: 1024px) {{
+    .block-container {{ max-width: 700px !important; }}
+}}
+@media (min-width: 1025px) {{
+    .block-container {{ max-width: 880px !important; }}
+    [data-testid="stChatMessageContent"],
+    [data-testid="stChatMessageContent"] p,
+    [data-testid="stChatMessageContent"] li {{
+        font-size: 1.2rem !important;
+    }}
+}}
 </style>
 <img class="carpanet-logo" src="data:image/jpeg;base64,{LOGO_B64}">
 """, unsafe_allow_html=True)
 
 MEMORIA_PERSISTENTE = _supabase_enabled()
+
+# --- Posizione (best-effort, sperimentale) --------------------------------
+# Nessuna nuova dipendenza pip: usiamo un piccolo componente HTML/JS che chiede
+# il permesso di geolocalizzazione al browser e, se concesso, aggiunge le
+# coordinate all'URL della pagina (una sola volta, alla primissima apertura,
+# PRIMA del login, cosi' non si rischia mai di far ricaricare la pagina
+# mentre qualcuno sta scrivendo il proprio PIN). Se il permesso viene negato
+# o l'utente lo ignora, semplicemente non succede nulla: nessun loop, nessun
+# blocco, l'app funziona comunque esattamente come prima.
+if "user_location" not in st.session_state:
+    st.session_state.user_location = None
+
+_qp = st.query_params
+if st.session_state.user_location is None and _qp.get("geo_lat") and _qp.get("geo_lon"):
+    try:
+        _lat = float(_qp.get("geo_lat"))
+        _lon = float(_qp.get("geo_lon"))
+        st.session_state.user_location = _reverse_geocode(_lat, _lon) or f"lat {_lat:.2f}, lon {_lon:.2f}"
+    except Exception:
+        st.session_state.user_location = None
+
+if st.session_state.user_location is None and not _qp.get("geo_lat") and not _qp.get("geo_denied"):
+    st.components.v1.html("""
+    <script>
+    (function () {
+        try {
+            var here = new URLSearchParams(window.top.location.search);
+            if (here.has('geo_lat') || here.has('geo_denied')) { return; }
+            if (!navigator.geolocation) { return; }
+            navigator.geolocation.getCurrentPosition(
+                function (pos) {
+                    var p = new URLSearchParams(window.top.location.search);
+                    p.set('geo_lat', pos.coords.latitude);
+                    p.set('geo_lon', pos.coords.longitude);
+                    window.top.location.search = p.toString();
+                },
+                function () {
+                    var p = new URLSearchParams(window.top.location.search);
+                    p.set('geo_denied', '1');
+                    window.top.location.search = p.toString();
+                },
+                { timeout: 8000, maximumAge: 600000 }
+            );
+        } catch (e) {}
+    })();
+    </script>
+    """, height=0)
 
 # --- Login familiare ------------------------------------------------------
 # Attivo solo se la memoria persistente (Supabase) e configurata: senza un
@@ -437,6 +636,23 @@ elif st.session_state.current_user is None:
 
 CURRENT_ROLE = st.session_state.current_user.get("role", "genitore")
 IS_PARENT = CURRENT_ROLE == "genitore"
+
+# --- Pagina di benvenuto (a ogni login, prima della chat) -----------------
+if st.session_state.get("just_logged_in"):
+    _nome_utente = st.session_state.current_user.get("name", "")
+    st.markdown(f"""
+    <div class="carpanet-welcome">
+        <img class="carpanet-welcome-logo" src="data:image/jpeg;base64,{LOGO_B64}">
+        <h1>Ciao {_nome_utente} 👋</h1>
+        <p class="carpanet-welcome-sub">{_saluto_orario().capitalize()}! Carpanet AI e pronta ad aiutarti.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    _col1, _col2, _col3 = st.columns([1, 2, 1])
+    with _col2:
+        if st.button("Entra nella chat →", use_container_width=True, type="primary"):
+            st.session_state.just_logged_in = False
+            st.rerun()
+    st.stop()
 
 with st.sidebar:
     st.markdown("### Carpanet AI")
@@ -555,10 +771,9 @@ else:
     if "knowledge_text" not in st.session_state:
         st.session_state.knowledge_text = load_knowledge()
 
-    if st.session_state.get("just_logged_in"):
-        nome_utente = st.session_state.current_user.get("name", "")
-        st.success(f"👋 Ciao {nome_utente}, {_saluto_orario()}!")
-        st.session_state.just_logged_in = False
+    # Nota: il messaggio di benvenuto/saluto viene mostrato in una pagina a se'
+    # stante subito dopo il login (vedi sopra, prima della sidebar), non piu'
+    # come banner dentro la chat.
 
     # Nota tecnica: Streamlit 1.60 supporta nativamente allegati (accept_file) e
     # registrazione vocale (accept_audio) direttamente dentro st.chat_input, con
@@ -624,7 +839,11 @@ else:
 
             response = None
             try:
-                api_messages = build_api_messages(st.session_state.messages, st.session_state.get("knowledge_text", ""))
+                api_messages = build_api_messages(
+                    st.session_state.messages,
+                    st.session_state.get("knowledge_text", ""),
+                    location_text=st.session_state.get("user_location"),
+                )
                 completion = client.chat.completions.create(
                     model=PRIMARY_MODEL,
                     messages=api_messages,
@@ -639,6 +858,7 @@ else:
                             st.session_state.get("knowledge_text", ""),
                             history_limit=3,
                             char_limit=600,
+                            location_text=st.session_state.get("user_location"),
                         )
                         fallback_completion = client.chat.completions.create(
                             model=FALLBACK_MODEL,
