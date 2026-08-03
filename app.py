@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import requests
 import streamlit as st
 from groq import Groq
@@ -34,6 +35,50 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 def _supabase_enabled():
     return SUPABASE_HEADERS is not None
+
+
+# --- pCloud (allegati: foto, video, documenti) --------------------------------
+# Configurazione via variabili d'ambiente, non ancora impostate su Render:
+# preferito: PCLOUD_ACCESS_TOKEN (token OAuth generato dalla dashboard sviluppatori
+# pCloud, non la password dell'account) + PCLOUD_API_HOST (eapi.pcloud.com per
+# account europei, api.pcloud.com per account US).
+PCLOUD_API_HOST = os.environ.get("PCLOUD_API_HOST", "eapi.pcloud.com")
+PCLOUD_ACCESS_TOKEN = os.environ.get("PCLOUD_ACCESS_TOKEN")
+PCLOUD_FOLDER_ID = os.environ.get("PCLOUD_FOLDER_ID", "0")  # 0 = cartella radice
+PCLOUD_TIMEOUT = 15
+
+
+def _pcloud_enabled():
+    return bool(PCLOUD_ACCESS_TOKEN)
+
+
+def pcloud_upload(file_bytes, filename):
+    """Carica un file su pCloud. Ritorna il fileid se riuscito, altrimenti None.
+    Non solleva mai eccezioni: se pCloud non e configurato o la chiamata fallisce,
+    l'app deve continuare a funzionare comunque (allegato semplicemente non salvato)."""
+    if not _pcloud_enabled():
+        return None
+    try:
+        r = requests.post(
+            f"https://{PCLOUD_API_HOST}/uploadfile",
+            params={
+                "auth": PCLOUD_ACCESS_TOKEN,
+                "folderid": PCLOUD_FOLDER_ID,
+                "filename": filename,
+                "nopartial": "1",
+            },
+            files={"file": (filename, file_bytes)},
+            timeout=PCLOUD_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("result") == 0:
+            metadata = data.get("metadata") or []
+            if metadata:
+                return metadata[0].get("fileid")
+        return None
+    except Exception:
+        return None
 
 
 def _load_memory_file():
@@ -153,6 +198,66 @@ def save_knowledge(text):
     _save_knowledge_file(text)
 
 
+# --- Login familiare e ruoli (genitore = accesso completo, figlio = limitato) --
+# Richiede la memoria persistente su Supabase: senza database esterno non c'e
+# un posto sicuro dove conservare gli account, quindi in quel caso il login
+# viene saltato e tutti vengono trattati come "genitore" (comportamento identico
+# a prima di questa modifica).
+def _hash_pin(pin):
+    return hashlib.sha256((str(pin) + "carpanet_family_salt_v1").encode("utf-8")).hexdigest()
+
+
+def _load_family_users():
+    if not _supabase_enabled():
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/family_users",
+            headers=SUPABASE_HEADERS,
+            params={"select": "id,name,role", "order": "id.asc"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
+def _verify_family_login(name, pin):
+    if not _supabase_enabled():
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/family_users",
+            headers=SUPABASE_HEADERS,
+            params={"select": "id,name,role,pin_hash", "name": f"eq.{name}"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if rows and rows[0].get("pin_hash") == _hash_pin(pin):
+            return {"id": rows[0]["id"], "name": rows[0]["name"], "role": rows[0]["role"]}
+        return None
+    except Exception:
+        return None
+
+
+def _create_family_user(name, pin, role):
+    if not _supabase_enabled():
+        return False
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/family_users",
+            headers=SUPABASE_HEADERS,
+            json={"name": name, "pin_hash": _hash_pin(pin), "role": role},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
 def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None):
     history_limit = history_limit or MAX_HISTORY_MESSAGES
     char_limit = char_limit or MAX_MESSAGE_CHARS
@@ -212,7 +317,34 @@ st.markdown(f"""
     -webkit-user-select: none !important;
     user-select: none !important;
     -webkit-touch-callout: none !important;
+    -webkit-user-drag: none !important;
     touch-action: manipulation !important;
+}}
+#carpanetMicBtn {{
+    touch-action: none !important;
+    position: relative !important;
+    z-index: 5 !important;
+    -webkit-tap-highlight-color: transparent !important;
+}}
+[data-testid="stChatInputTextArea"] {{
+    color: #f2f6ff !important;
+    font-size: 1rem !important;
+}}
+[data-testid="stChatInputTextArea"]::placeholder {{
+    color: #a9b8d6 !important;
+    opacity: 1 !important;
+}}
+[data-testid="stChatInput"] button svg {{
+    color: #0a0e17 !important;
+}}
+.stApp, [data-testid="stAppViewContainer"] {{
+    color: #f2f6ff !important;
+}}
+[data-testid="stSidebar"] * {{
+    color: #f2f6ff !important;
+}}
+[data-testid="stCaptionContainer"], .stCaption, small {{
+    color: #b9c6e6 !important;
 }}
 .carpanet-logo {{
     display: block;
@@ -226,35 +358,158 @@ st.markdown(f"""
 
 MEMORIA_PERSISTENTE = _supabase_enabled()
 
+# --- Login familiare ------------------------------------------------------
+# Attivo solo se la memoria persistente (Supabase) e configurata: senza un
+# database esterno non c'e un posto sicuro dove tenere gli account, quindi
+# in quel caso si salta il login e si trattano tutti come "genitore" (nessun
+# cambiamento di comportamento rispetto a prima).
+if "current_user" not in st.session_state:
+    st.session_state.current_user = None
+
+if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
+    st.markdown("## 👨‍👩‍👧‍👦 Accesso famiglia")
+    existing_users = _load_family_users()
+    if not existing_users:
+        st.info("Nessun account ancora creato. Crea il primo account (genitore) per iniziare.")
+        with st.form("bootstrap_parent_form"):
+            new_name = st.text_input("Il tuo nome")
+            new_pin = st.text_input("Scegli un PIN (4-6 cifre)", type="password")
+            submitted = st.form_submit_button("Crea account genitore")
+            if submitted:
+                if new_name.strip() and new_pin.strip():
+                    if _create_family_user(new_name.strip(), new_pin.strip(), "genitore"):
+                        st.session_state.current_user = {"name": new_name.strip(), "role": "genitore"}
+                        st.rerun()
+                    else:
+                        st.error("Errore nella creazione dell'account. Riprova.")
+                else:
+                    st.warning("Inserisci nome e PIN.")
+    else:
+        names = [u["name"] for u in existing_users]
+        with st.form("login_form"):
+            selected_name = st.selectbox("Chi sei?", names)
+            pin_input = st.text_input("PIN", type="password")
+            submitted = st.form_submit_button("Accedi")
+            if submitted:
+                user = _verify_family_login(selected_name, pin_input)
+                if user:
+                    st.session_state.current_user = user
+                    st.rerun()
+                else:
+                    st.error("PIN errato.")
+    st.stop()
+elif st.session_state.current_user is None:
+    # Memoria persistente non configurata: nessun posto sicuro per gli account,
+    # quindi si procede senza login, con accesso completo (comportamento invariato).
+    st.session_state.current_user = {"name": "Utente", "role": "genitore"}
+
+CURRENT_ROLE = st.session_state.current_user.get("role", "genitore")
+IS_PARENT = CURRENT_ROLE == "genitore"
+
 with st.sidebar:
     st.markdown("### Carpanet AI")
+
     if MEMORIA_PERSISTENTE:
+        user_name = st.session_state.current_user.get("name", "Utente")
+        role_label = "Genitore (accesso completo)" if IS_PARENT else "Figlio (accesso limitato)"
+        st.caption(f"👤 {user_name} — {role_label}")
+        if st.button("Esci"):
+            st.session_state.current_user = None
+            st.rerun()
         st.caption("La memoria e collegata a un database esterno: la cronologia resta anche se Render riavvia il servizio. Al modello viene comunque inviata solo la parte piu recente per evitare errori.")
     else:
         st.caption("La cronologia mostrata resta finche il server e attivo; al modello viene inviata solo la parte piu recente per evitare errori. Se Render riavvia il servizio, tutto si azzera (database esterno non configurato).")
-    if st.button("Nuova conversazione"):
+
+    if IS_PARENT and st.button("Nuova conversazione"):
         st.session_state.messages = []
         save_memory([])
         st.rerun()
 
     st.markdown("---")
-    st.markdown("#### Istruzioni permanenti (addestramento)")
-    if MEMORIA_PERSISTENTE:
-        st.caption("Scrivi qui cosa Carpanet AI deve sempre sapere o come si deve comportare: resta valido anche se la chat si azzera o Render riavvia il servizio, perche viene salvato su un database esterno.")
-    else:
-        st.caption("Scrivi qui cosa Carpanet AI deve sempre sapere o come si deve comportare: resta valido anche se la chat si azzera. Nota: su questo piano Render gratuito, se il servizio si riavvia per inattivita, anche queste istruzioni vengono perse finche non le salvi di nuovo (database esterno non configurato).")
-    if "knowledge_text" not in st.session_state:
-        st.session_state.knowledge_text = load_knowledge()
-    knowledge_input = st.text_area(
-        "Conoscenza permanente",
-        value=st.session_state.knowledge_text,
-        height=150,
-        label_visibility="collapsed",
+    st.markdown("#### Risposte vocali")
+    if "tts_enabled" not in st.session_state:
+        st.session_state.tts_enabled = True
+    st.session_state.tts_enabled = st.toggle(
+        "Leggi le risposte ad alta voce",
+        value=st.session_state.tts_enabled,
+        help="Se disattivato, le risposte vengono mostrate solo come testo, senza sintesi vocale.",
     )
-    if st.button("Salva istruzioni"):
-        save_knowledge(knowledge_input)
-        st.session_state.knowledge_text = knowledge_input
-        st.success("Istruzioni salvate.")
+
+    if IS_PARENT:
+        st.markdown("---")
+        st.markdown("#### Istruzioni permanenti (addestramento)")
+        if MEMORIA_PERSISTENTE:
+            st.caption("Scrivi qui cosa Carpanet AI deve sempre sapere o come si deve comportare: resta valido anche se la chat si azzera o Render riavvia il servizio, perche viene salvato su un database esterno.")
+        else:
+            st.caption("Scrivi qui cosa Carpanet AI deve sempre sapere o come si deve comportare: resta valido anche se la chat si azzera. Nota: su questo piano Render gratuito, se il servizio si riavvia per inattivita, anche queste istruzioni vengono perse finche non le salvi di nuovo (database esterno non configurato).")
+        if "knowledge_text" not in st.session_state:
+            st.session_state.knowledge_text = load_knowledge()
+        knowledge_input = st.text_area(
+            "Conoscenza permanente",
+            value=st.session_state.knowledge_text,
+            height=150,
+            label_visibility="collapsed",
+        )
+        if st.button("Salva istruzioni"):
+            save_knowledge(knowledge_input)
+            st.session_state.knowledge_text = knowledge_input
+            st.success("Istruzioni salvate.")
+
+    if IS_PARENT:
+        st.markdown("---")
+        st.markdown("#### 📊 Graphify — statistiche")
+        if MEMORIA_PERSISTENTE:
+            try:
+                r = requests.get(
+                    f"{SUPABASE_URL}/rest/v1/chat_messages",
+                    headers=SUPABASE_HEADERS,
+                    params={"select": "role,created_at", "order": "id.asc"},
+                    timeout=SUPABASE_TIMEOUT,
+                )
+                r.raise_for_status()
+                rows = r.json()
+                if rows:
+                    import pandas as pd
+                    df = pd.DataFrame(rows)
+                    df["giorno"] = pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d")
+                    per_day = df.groupby("giorno").size()
+                    st.caption(f"Messaggi totali salvati: {len(rows)}")
+                    st.bar_chart(per_day)
+                    per_role = df.groupby("role").size()
+                    st.caption("Messaggi per ruolo (utente / assistente):")
+                    st.bar_chart(per_role)
+                else:
+                    st.caption("Nessun dato ancora disponibile per i grafici.")
+            except Exception:
+                st.caption("Statistiche non disponibili al momento (problema di connessione al database).")
+        else:
+            st.caption("I grafici dettagliati richiedono la memoria persistente su database (Supabase), attualmente attiva. Se non e raggiungibile, qui non vedrai dati.")
+
+    st.markdown("---")
+    st.markdown("#### 📎 Allegati (pCloud)")
+    ALLEGATI_ATTIVI = _pcloud_enabled()
+    if ALLEGATI_ATTIVI:
+        st.caption("Gli allegati inviati dalla chat vengono salvati su pCloud.")
+    else:
+        st.caption("Il salvataggio su pCloud non e ancora configurato: gli allegati verranno comunque accettati ma non salvati in modo permanente, finche non vengono aggiunte le credenziali pCloud.")
+
+    if IS_PARENT and MEMORIA_PERSISTENTE:
+        st.markdown("---")
+        st.markdown("#### 👨‍👩‍👧‍👦 Gestione famiglia")
+        st.caption("Aggiungi un altro membro della famiglia (genitore o figlio). Chi ha ruolo 'figlio' non vede le istruzioni permanenti, le statistiche Graphify, ne puo azzerare la conversazione.")
+        with st.form("add_family_member_form"):
+            member_name = st.text_input("Nome")
+            member_pin = st.text_input("PIN (4-6 cifre)", type="password")
+            member_role = st.selectbox("Ruolo", ["figlio", "genitore"])
+            add_submitted = st.form_submit_button("Aggiungi membro")
+            if add_submitted:
+                if member_name.strip() and member_pin.strip():
+                    if _create_family_user(member_name.strip(), member_pin.strip(), member_role):
+                        st.success(f"Account creato per {member_name.strip()} ({member_role}).")
+                    else:
+                        st.error("Errore nella creazione dell'account (nome forse gia usato). Riprova.")
+                else:
+                    st.warning("Inserisci nome e PIN.")
 
 groq_api_key = os.environ.get("GROQ_API_KEY")
 
@@ -320,17 +575,23 @@ else:
                 '<path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" fill="#0a0e17"/>' +
                 '<path d="M19 11a7 7 0 0 1-14 0M12 18v3" stroke="#0a0e17" stroke-width="2" stroke-linecap="round" fill="none"/>' +
                 '</svg>';
+            micBtn.setAttribute('draggable', 'false');
             micBtn.style.cssText =
-                'width:42px;height:42px;border-radius:50%;border:none;' +
+                'width:46px;height:46px;min-width:46px;border-radius:50%;border:none;' +
                 'background:linear-gradient(135deg,#00e5ff,#7b5cff);color:#0a0e17;' +
                 'cursor:pointer;display:flex;align-items:center;justify-content:center;' +
-                'margin:4px 6px;flex-shrink:0;-webkit-tap-highlight-color:transparent;';
+                'margin:4px 6px;flex-shrink:0;-webkit-tap-highlight-color:transparent;' +
+                'touch-action:none;-webkit-user-drag:none;position:relative;z-index:5;';
 
-            // Blocca subito il long-press/selezione al primo contatto col dito,
-            // prima che il browser possa mostrare il menu di selezione testo.
-            micBtn.addEventListener('touchstart', function(e) {
-                e.preventDefault();
-            }, { passive: false });
+            // Blocca il gesto nativo (long-press/selezione/drag) il prima possibile,
+            // intercettando sia i touch event che i pointer event, prima che il
+            // browser possa avviare selezione testo o menu contestuale.
+            ['touchstart', 'pointerdown', 'selectstart'].forEach(function(evtName) {
+                micBtn.addEventListener(evtName, function(e) {
+                    e.preventDefault();
+                    if (e.stopPropagation) e.stopPropagation();
+                }, { passive: false });
+            });
             micBtn.addEventListener('contextmenu', function(e) {
                 e.preventDefault();
             });
@@ -424,7 +685,50 @@ else:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    with st.popover("📎 Allega foto, video o file"):
+        st.caption("Scegli cosa allegare al prossimo messaggio")
+        attach_kind = st.radio(
+            "Tipo di allegato",
+            ["Foto dalla galleria", "Scatta una foto", "Video", "File generico"],
+            label_visibility="collapsed",
+            key="attach_kind",
+        )
+        uploaded_file = None
+        if attach_kind == "Scatta una foto":
+            uploaded_file = st.camera_input("Scatta una foto", key="attach_camera")
+        elif attach_kind == "Foto dalla galleria":
+            uploaded_file = st.file_uploader("Scegli una foto", type=["png", "jpg", "jpeg", "heic", "webp"], key="attach_gallery")
+        elif attach_kind == "Video":
+            uploaded_file = st.file_uploader("Scegli un video", type=["mp4", "mov", "avi", "webm"], key="attach_video")
+        else:
+            uploaded_file = st.file_uploader("Scegli un file", key="attach_file")
+
+        if uploaded_file is not None:
+            st.session_state.pending_attachment = uploaded_file
+            st.success(f"Pronto per l'invio: {uploaded_file.name}")
+
+    if st.session_state.get("pending_attachment") is not None:
+        col_a, col_b = st.columns([4, 1])
+        with col_a:
+            st.caption(f"📎 Allegato pronto: {st.session_state.pending_attachment.name} — verra inviato con il prossimo messaggio.")
+        with col_b:
+            if st.button("Rimuovi", key="remove_attachment"):
+                st.session_state.pending_attachment = None
+                st.rerun()
+
     if prompt := st.chat_input("Chiedimi qualcosa o usa il microfono accanto al campo..."):
+        attachment_note = ""
+        attachment = st.session_state.get("pending_attachment")
+        if attachment is not None:
+            file_bytes = attachment.getvalue()
+            fileid = pcloud_upload(file_bytes, attachment.name)
+            if fileid is not None:
+                attachment_note = f"\n\n[Allegato salvato su pCloud: {attachment.name}]"
+            else:
+                attachment_note = f"\n\n[Allegato ricevuto: {attachment.name} — non salvato in modo permanente perche pCloud non e ancora configurato o non e raggiungibile]"
+            st.session_state.pending_attachment = None
+
+        prompt = prompt + attachment_note
         st.session_state.messages.append({"role": "user", "content": prompt})
         save_memory(st.session_state.messages)
         with st.chat_message("user"):
@@ -469,11 +773,12 @@ else:
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 save_memory(st.session_state.messages)
 
-                tts_script = f"""
-                <script>
-                    var msg = new SpeechSynthesisUtterance({repr(response)});
-                    msg.lang = 'it-IT';
-                    window.speechSynthesis.speak(msg);
-                </script>
-                """
-                st.components.v1.html(tts_script, height=0)
+                if st.session_state.get("tts_enabled", True):
+                    tts_script = f"""
+                    <script>
+                        var msg = new SpeechSynthesisUtterance({repr(response)});
+                        msg.lang = 'it-IT';
+                        window.speechSynthesis.speak(msg);
+                    </script>
+                    """
+                    st.components.v1.html(tts_script, height=0)
