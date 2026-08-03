@@ -38,46 +38,65 @@ def _supabase_enabled():
     return SUPABASE_HEADERS is not None
 
 
-# --- pCloud (allegati: foto, video, documenti) --------------------------------
-# Configurazione via variabili d'ambiente, non ancora impostate su Render:
-# preferito: PCLOUD_ACCESS_TOKEN (token OAuth generato dalla dashboard sviluppatori
-# pCloud, non la password dell'account) + PCLOUD_API_HOST (eapi.pcloud.com per
-# account europei, api.pcloud.com per account US).
-PCLOUD_API_HOST = os.environ.get("PCLOUD_API_HOST", "eapi.pcloud.com")
-PCLOUD_ACCESS_TOKEN = os.environ.get("PCLOUD_ACCESS_TOKEN")
-PCLOUD_FOLDER_ID = os.environ.get("PCLOUD_FOLDER_ID", "0")  # 0 = cartella radice
-PCLOUD_TIMEOUT = 15
+# --- Mega (allegati: foto, video, documenti) ----------------------------------
+# Configurazione via variabili d'ambiente su Render: MEGA_EMAIL e MEGA_PASSWORD
+# (le credenziali del tuo account Mega, mai gestite da Claude: le imposti tu
+# direttamente su Render). Cartella opzionale: MEGA_FOLDER_NAME (se non impostata,
+# i file vengono caricati nella root del tuo Mega).
+MEGA_EMAIL = os.environ.get("MEGA_EMAIL")
+MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD")
+MEGA_FOLDER_NAME = os.environ.get("MEGA_FOLDER_NAME")
+
+_mega_client = None
+_mega_folder_node = None
 
 
-def _pcloud_enabled():
-    return bool(PCLOUD_ACCESS_TOKEN)
+def _mega_enabled():
+    return bool(MEGA_EMAIL and MEGA_PASSWORD)
 
 
-def pcloud_upload(file_bytes, filename):
-    """Carica un file su pCloud. Ritorna il fileid se riuscito, altrimenti None.
-    Non solleva mai eccezioni: se pCloud non e configurato o la chiamata fallisce,
+def _get_mega_client():
+    """Crea (una sola volta per processo) e ritorna il client Mega gia' loggato.
+    Ritorna None se le credenziali non sono configurate o il login fallisce."""
+    global _mega_client
+    if not _mega_enabled():
+        return None
+    if _mega_client is not None:
+        return _mega_client
+    try:
+        from mega import Mega
+        _mega_client = Mega().login(MEGA_EMAIL, MEGA_PASSWORD)
+        return _mega_client
+    except Exception:
+        _mega_client = None
+        return None
+
+
+def mega_upload(file_bytes, filename):
+    """Carica un file su Mega. Ritorna un link di condivisione se riuscito, altrimenti None.
+    Non solleva mai eccezioni: se Mega non e configurato o la chiamata fallisce,
     l'app deve continuare a funzionare comunque (allegato semplicemente non salvato)."""
-    if not _pcloud_enabled():
+    m = _get_mega_client()
+    if m is None:
         return None
     try:
-        r = requests.post(
-            f"https://{PCLOUD_API_HOST}/uploadfile",
-            params={
-                "auth": PCLOUD_ACCESS_TOKEN,
-                "folderid": PCLOUD_FOLDER_ID,
-                "filename": filename,
-                "nopartial": "1",
-            },
-            files={"file": (filename, file_bytes)},
-            timeout=PCLOUD_TIMEOUT,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("result") == 0:
-            metadata = data.get("metadata") or []
-            if metadata:
-                return metadata[0].get("fileid")
-        return None
+        import tempfile
+        suffix = "_" + filename
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            global _mega_folder_node
+            dest_node = None
+            if MEGA_FOLDER_NAME:
+                if _mega_folder_node is None:
+                    found = m.find(MEGA_FOLDER_NAME)
+                    _mega_folder_node = found[0] if found else m.create_folder(MEGA_FOLDER_NAME)
+                dest_node = _mega_folder_node
+            uploaded = m.upload(tmp_path, dest_node) if dest_node else m.upload(tmp_path)
+            return m.get_upload_link(uploaded)
+        finally:
+            os.remove(tmp_path)
     except Exception:
         return None
 
@@ -498,12 +517,12 @@ with st.sidebar:
             st.caption("I grafici dettagliati richiedono la memoria persistente su database (Supabase), attualmente attiva. Se non e raggiungibile, qui non vedrai dati.")
 
     st.markdown("---")
-    st.markdown("#### 📎 Allegati (pCloud)")
-    ALLEGATI_ATTIVI = _pcloud_enabled()
+    st.markdown("#### 📎 Allegati (Mega)")
+    ALLEGATI_ATTIVI = _mega_enabled()
     if ALLEGATI_ATTIVI:
-        st.caption("Gli allegati inviati dalla chat vengono salvati su pCloud.")
+        st.caption("Gli allegati inviati dalla chat vengono salvati su Mega.")
     else:
-        st.caption("Il salvataggio su pCloud non e ancora configurato: gli allegati verranno comunque accettati ma non salvati in modo permanente, finche non vengono aggiunte le credenziali pCloud.")
+        st.caption("Il salvataggio su Mega non e ancora configurato: gli allegati verranno comunque accettati ma non salvati in modo permanente, finche non vengono aggiunte le credenziali Mega.")
 
     if IS_PARENT and MEMORIA_PERSISTENTE:
         st.markdown("---")
@@ -579,11 +598,11 @@ else:
 
         for f in (user_input.files or []):
             file_bytes = f.getvalue()
-            fileid = pcloud_upload(file_bytes, f.name)
-            if fileid is not None:
-                notes.append(f"[Allegato salvato su pCloud: {f.name}]")
+            mega_link = mega_upload(file_bytes, f.name)
+            if mega_link is not None:
+                notes.append(f"[Allegato salvato su Mega: {f.name} ({mega_link})]")
             else:
-                notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche pCloud non e ancora configurato o non e raggiungibile]")
+                notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche Mega non e ancora configurato o non e raggiungibile]")
 
         if notes:
             prompt = (prompt + "\n\n" + "\n".join(notes)).strip() if prompt else "\n".join(notes)
