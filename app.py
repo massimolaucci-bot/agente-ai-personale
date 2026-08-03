@@ -63,7 +63,7 @@ def _get_gdrive_client():
     Ritorna None se le credenziali non sono configurate o non sono valide."""
     global _gdrive_client
     if not _gdrive_enabled():
-        print("[Google Drive] Non configurato: manca GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_DRIVE_FOLDER_ID.")
+        print("[Google Drive] Non configurato: manca GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_DRIVE_FOLDER_ID.", flush=True)
         return None
     if _gdrive_client is not None:
         return _gdrive_client
@@ -80,7 +80,7 @@ def _get_gdrive_client():
         # Log dell'errore reale nei log di Render (visibile su Dashboard > Logs), utile
         # per capire la causa esatta (JSON malformato, credenziali non valide, ecc.)
         # invece del generico "non configurato o non raggiungibile" mostrato in chat.
-        print(f"[Google Drive] ERRORE creazione client: {type(e).__name__}: {e}")
+        print(f"[Google Drive] ERRORE creazione client: {type(e).__name__}: {e}", flush=True)
         _gdrive_client = None
         return None
 
@@ -90,8 +90,10 @@ def gdrive_upload(file_bytes, filename):
     al file se riuscito, altrimenti None. Non solleva mai eccezioni: se Google Drive
     non e configurato o la chiamata fallisce, l'app deve continuare a funzionare
     comunque (allegato semplicemente non salvato)."""
+    print(f"[Google Drive] Tentativo di upload di '{filename}'...", flush=True)
     service = _get_gdrive_client()
     if service is None:
+        print("[Google Drive] Upload annullato: client non disponibile (vedi errore sopra).", flush=True)
         return None
     try:
         import io
@@ -103,9 +105,10 @@ def gdrive_upload(file_bytes, filename):
         created = service.files().create(
             body=metadata, media_body=media, fields="id, webViewLink"
         ).execute()
+        print(f"[Google Drive] Upload riuscito: {created.get('id')}", flush=True)
         return created.get("webViewLink") or created.get("id")
     except Exception as e:
-        print(f"[Google Drive] ERRORE durante il caricamento di '{filename}': {type(e).__name__}: {e}")
+        print(f"[Google Drive] ERRORE durante il caricamento di '{filename}': {type(e).__name__}: {e}", flush=True)
         return None
 
 
