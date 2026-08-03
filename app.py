@@ -3,6 +3,7 @@ import json
 import hashlib
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from groq import Groq
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -610,17 +611,23 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
 st.set_page_config(page_title="Carpanet AI", page_icon="static/icon-192.png", layout="centered")
 
 # --- PWA: installazione come app sulla schermata Home -----------------------
-# Inietta nel <head> reale della pagina (non in un iframe: st.markdown con
-# unsafe_allow_html finisce nel documento principale, esattamente come il CSS
-# sottostante) il collegamento al manifest, le icone per iOS/Android, i meta
-# tag "app installabile" e la registrazione del service worker. Il controllo
-# "se non gia' presente" evita di duplicare i tag ad ogni rerun di Streamlit.
-st.markdown("""
+# IMPORTANTE: un <script> inserito tramite st.markdown(unsafe_allow_html=True)
+# NON viene mai eseguito dal browser (i tag <script> impostati via innerHTML
+# sono inerti per specifica HTML: e' una nota "trappola" di Streamlit). Il CSS
+# funziona con st.markdown perche' i <style> vengono applicati anche cosi', ma
+# per eseguire davvero del JavaScript serve st.components.v1.html, che crea
+# un vero iframe (srcdoc, stessa origine) in cui gli script sono eseguiti sul
+# serio. Da li' si raggiunge il documento reale della pagina con
+# window.parent.document, e si registrano manifest/icone/service worker sulla
+# pagina vera (non sull'iframe stesso). Il controllo "se non gia' presente"
+# evita di duplicare i tag ad ogni rerun di Streamlit.
+components.html("""
 <script>
 (function() {
-    var head = window.parent ? window.parent.document.head : document.head;
-    var doc = window.parent ? window.parent.document : document;
-    if (head.querySelector('link[rel="manifest"]')) { return; }
+    var topWin = window.parent || window;
+    var doc = topWin.document;
+    var head = doc.head;
+    if (!head || head.querySelector('link[rel="manifest"]')) { return; }
 
     function addTag(tag, attrs) {
         var el = doc.createElement(tag);
@@ -656,12 +663,12 @@ st.markdown("""
         addTag('meta', {name: 'viewport', content: 'width=device-width, initial-scale=1, viewport-fit=cover'});
     }
 
-    if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/app/static/sw.js').catch(function() {});
+    if ('serviceWorker' in topWin.navigator) {
+        topWin.navigator.serviceWorker.register('/app/static/sw.js').catch(function() {});
     }
 })();
 </script>
-""", unsafe_allow_html=True)
+""", height=0)
 
 GRADIENT_CSS = "linear-gradient(135deg, #0a0e17 0%, #10162a 100%)"
 
