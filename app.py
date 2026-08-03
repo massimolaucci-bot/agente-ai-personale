@@ -39,77 +39,104 @@ def _supabase_enabled():
     return SUPABASE_HEADERS is not None
 
 
-# --- Google Drive (allegati: foto, video, documenti) --------------------------
-# Usa un Service Account Google (niente login OAuth interattivo, niente token che
-# scadono da rinnovare a mano). Configurazione via variabili d'ambiente su Render:
-# - GOOGLE_SERVICE_ACCOUNT_JSON: il contenuto INTERO del file JSON della chiave del
-#   service account (creato dalla Google Cloud Console), incollato come testo.
-# - GOOGLE_DRIVE_FOLDER_ID: l'ID della cartella nel tuo Google Drive che hai
-#   condiviso con l'email del service account (dando permesso "Editor"): e' li
-#   che finiscono gli allegati, e occupano lo spazio del TUO account, non quello
-#   (nullo) del service account.
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+# --- Cloudflare R2 (storage: allegati chat + documenti di addestramento) ------
+# R2 e' compatibile con l'API S3 di Amazon: usiamo boto3, la libreria standard
+# per parlare con storage "a oggetti". A differenza di Google Drive con un
+# account di servizio, qui lo spazio appartiene davvero al bucket (nessun
+# problema di "quota zero"). Due bucket separati per tenere distinti gli
+# allegati occasionali della chat dai documenti caricati per l'addestramento.
+# Variabili d'ambiente su Render:
+# - R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY: credenziali del
+#   token API R2 generato su Cloudflare.
+# - R2_BUCKET_ALLEGATI / R2_BUCKET_ADDESTRAMENTO: nomi dei due bucket.
+# - R2_PUBLIC_URL_ALLEGATI / R2_PUBLIC_URL_ADDESTRAMENTO: indirizzo pubblico
+#   (r2.dev) di ciascun bucket, per costruire link diretti ai file caricati.
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_ALLEGATI = os.environ.get("R2_BUCKET_ALLEGATI", "carpanet-allegati")
+R2_BUCKET_ADDESTRAMENTO = os.environ.get("R2_BUCKET_ADDESTRAMENTO", "carpanet-addestramento")
+R2_PUBLIC_URL_ALLEGATI = (os.environ.get("R2_PUBLIC_URL_ALLEGATI") or "").rstrip("/")
+R2_PUBLIC_URL_ADDESTRAMENTO = (os.environ.get("R2_PUBLIC_URL_ADDESTRAMENTO") or "").rstrip("/")
 
-_gdrive_client = None
+_r2_client = None
 
 
-def _gdrive_enabled():
-    return bool(GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_DRIVE_FOLDER_ID)
+def _r2_enabled():
+    return bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY)
 
 
-def _get_gdrive_client():
-    """Crea (una sola volta per processo) e ritorna il client Google Drive.
+def _get_r2_client():
+    """Crea (una sola volta per processo) e ritorna il client Cloudflare R2.
     Ritorna None se le credenziali non sono configurate o non sono valide."""
-    global _gdrive_client
-    if not _gdrive_enabled():
-        print("[Google Drive] Non configurato: manca GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_DRIVE_FOLDER_ID.", flush=True)
+    global _r2_client
+    if not _r2_enabled():
+        print("[R2] Non configurato: mancano R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY.", flush=True)
         return None
-    if _gdrive_client is not None:
-        return _gdrive_client
+    if _r2_client is not None:
+        return _r2_client
     try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/drive"]
+        import boto3
+        _r2_client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
         )
-        _gdrive_client = build("drive", "v3", credentials=creds, cache_discovery=False)
-        return _gdrive_client
+        return _r2_client
     except Exception as e:
-        # Log dell'errore reale nei log di Render (visibile su Dashboard > Logs), utile
-        # per capire la causa esatta (JSON malformato, credenziali non valide, ecc.)
-        # invece del generico "non configurato o non raggiungibile" mostrato in chat.
-        print(f"[Google Drive] ERRORE creazione client: {type(e).__name__}: {e}", flush=True)
-        _gdrive_client = None
+        print(f"[R2] ERRORE creazione client: {type(e).__name__}: {e}", flush=True)
+        _r2_client = None
         return None
 
 
-def gdrive_upload(file_bytes, filename):
-    """Carica un file su Google Drive (nella cartella condivisa). Ritorna un link
-    al file se riuscito, altrimenti None. Non solleva mai eccezioni: se Google Drive
-    non e configurato o la chiamata fallisce, l'app deve continuare a funzionare
-    comunque (allegato semplicemente non salvato)."""
-    print(f"[Google Drive] Tentativo di upload di '{filename}'...", flush=True)
-    service = _get_gdrive_client()
-    if service is None:
-        print("[Google Drive] Upload annullato: client non disponibile (vedi errore sopra).", flush=True)
+def r2_upload(file_bytes, filename, bucket, public_base_url):
+    """Carica un file su Cloudflare R2 (nel bucket indicato). Ritorna un link
+    pubblico se riuscito, altrimenti None. Non solleva mai eccezioni: se R2 non
+    e configurato o la chiamata fallisce, l'app deve continuare a funzionare
+    comunque (file semplicemente non salvato)."""
+    client = _get_r2_client()
+    if client is None or not bucket:
         return None
+    try:
+        import mimetypes
+        import time
+        import re
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
+        key = f"{int(time.time())}_{safe_name}"
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        client.put_object(Bucket=bucket, Key=key, Body=file_bytes, ContentType=mime_type)
+        return f"{public_base_url}/{key}" if public_base_url else key
+    except Exception as e:
+        print(f"[R2] ERRORE durante il caricamento di '{filename}' nel bucket '{bucket}': {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _extract_pdf_text(file_bytes):
+    """Estrae il testo da un PDF. Ritorna stringa vuota se non riesce (es. PDF
+    scansionato senza testo selezionabile, o file corrotto)."""
     try:
         import io
-        import mimetypes
-        from googleapiclient.http import MediaIoBaseUpload
-        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
-        metadata = {"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
-        created = service.files().create(
-            body=metadata, media_body=media, fields="id, webViewLink"
-        ).execute()
-        print(f"[Google Drive] Upload riuscito: {created.get('id')}", flush=True)
-        return created.get("webViewLink") or created.get("id")
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
     except Exception as e:
-        print(f"[Google Drive] ERRORE durante il caricamento di '{filename}': {type(e).__name__}: {e}", flush=True)
-        return None
+        print(f"[Addestramento] ERRORE estrazione testo PDF: {type(e).__name__}: {e}", flush=True)
+        return ""
+
+
+def _extract_docx_text(file_bytes):
+    """Estrae il testo da un documento Word (.docx). Ritorna stringa vuota se
+    non riesce."""
+    try:
+        import io
+        from docx import Document
+        doc = Document(io.BytesIO(file_bytes))
+        return "\n".join(p.text for p in doc.paragraphs).strip()
+    except Exception as e:
+        print(f"[Addestramento] ERRORE estrazione testo Word: {type(e).__name__}: {e}", flush=True)
+        return ""
 
 
 def _load_memory_file():
@@ -330,6 +357,92 @@ def save_knowledge(text):
     _save_knowledge_file(text)
 
 
+# --- Documenti di addestramento (PDF/Word caricati, letti e usati dall'AI) -----
+# A differenza delle "istruzioni permanenti" (un unico testo scritto a mano),
+# qui si caricano interi documenti: il testo viene estratto una volta al
+# caricamento e salvato nel database (tabella "knowledge_documents"). Quando
+# arriva una domanda, si cerca automaticamente nei documenti con la ricerca
+# full-text nativa di Postgres (nessun servizio esterno, nessuna chiave API in
+# piu, nessun rischio di cancellazione dati come con un database a grafo).
+def save_knowledge_document(filename, content_text, file_url):
+    if not _supabase_enabled():
+        return False
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/knowledge_documents",
+            headers=SUPABASE_HEADERS,
+            json={"filename": filename, "content_text": content_text, "file_url": file_url},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[Addestramento] ERRORE salvataggio documento '{filename}': {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+def list_knowledge_documents(limit=50):
+    if not _supabase_enabled():
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/knowledge_documents",
+            headers=SUPABASE_HEADERS,
+            params={"select": "id,filename,file_url,created_at", "order": "id.desc", "limit": str(limit)},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
+def delete_knowledge_document(doc_id):
+    if not _supabase_enabled():
+        return
+    try:
+        r = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/knowledge_documents",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{doc_id}"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+    except Exception:
+        pass
+
+
+def search_knowledge_documents(query_text, limit=3):
+    """Cerca nei documenti di addestramento caricati i passaggi piu pertinenti
+    rispetto al messaggio dell'utente, usando la ricerca full-text nativa di
+    Postgres (via Supabase REST). Ritorna una lista vuota se non ci sono
+    corrispondenze o il database non e raggiungibile: non blocca mai la chat."""
+    if not _supabase_enabled() or not query_text or not query_text.strip():
+        return []
+    try:
+        import re
+        parole = re.findall(r"\w+", query_text.lower())
+        parole = [p for p in parole if len(p) > 2][:8]
+        if not parole:
+            return []
+        query_fts = " | ".join(parole)
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/knowledge_documents",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "filename,content_text",
+                "content_text": f"fts(italian).{query_fts}",
+                "limit": str(limit),
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[Addestramento] ERRORE ricerca documenti: {type(e).__name__}: {e}", flush=True)
+        return []
+
+
 # --- Login familiare e ruoli (genitore = accesso completo, figlio = limitato) --
 # Richiede la memoria persistente su Supabase: senza database esterno non c'e
 # un posto sicuro dove conservare gli account, quindi in quel caso il login
@@ -471,6 +584,18 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
             "\n\nInformazioni e istruzioni permanenti fornite dall'utente: seguile sempre.\n"
             + knowledge_text.strip()
         )
+
+    # Documenti di addestramento (PDF/Word) caricati dall'utente: cerca i
+    # passaggi piu' pertinenti rispetto all'ultima domanda e li aggiunge come
+    # contesto, cosi' l'AI puo' usarli per rispondere senza doverli leggere
+    # sempre tutti per intero.
+    ultimo_messaggio_utente = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+    estratti_documenti = search_knowledge_documents(ultimo_messaggio_utente)
+    if estratti_documenti:
+        system_prompt += "\n\nEstratti rilevanti dai documenti caricati dall'utente (usali se utili per rispondere):\n"
+        for doc in estratti_documenti:
+            testo_estratto = (doc.get("content_text") or "")[:1200]
+            system_prompt += f"\n--- Da '{doc.get('filename')}' ---\n{testo_estratto}\n"
 
     api_messages = [{"role": "system", "content": system_prompt}]
     recent = history[-history_limit:]
@@ -846,6 +971,52 @@ with st.sidebar:
 
     if IS_PARENT:
         st.markdown("---")
+        st.markdown("#### 📚 Documenti di addestramento (PDF/Word)")
+        _addestramento_attivo = _r2_enabled() and _supabase_enabled()
+        if _addestramento_attivo:
+            st.caption("Carica un PDF o un Word: il contenuto viene letto e usato automaticamente da Carpanet AI per rispondere alle domande pertinenti, in modo permanente.")
+        else:
+            st.caption("Funzione non ancora attiva: manca la configurazione dello spazio di archiviazione dedicato all'addestramento.")
+        doc_upload = st.file_uploader(
+            "Carica documento",
+            type=["pdf", "docx"],
+            label_visibility="collapsed",
+            key="doc_uploader",
+            disabled=not _addestramento_attivo,
+        )
+        if doc_upload is not None and st.button("Aggiungi ai documenti di addestramento", disabled=not _addestramento_attivo):
+            _file_bytes = doc_upload.getvalue()
+            if doc_upload.name.lower().endswith(".pdf"):
+                _testo_estratto = _extract_pdf_text(_file_bytes)
+            else:
+                _testo_estratto = _extract_docx_text(_file_bytes)
+            if not _testo_estratto:
+                st.error("Non sono riuscito a leggere il contenuto del file. Controlla che non sia un PDF scansionato senza testo selezionabile (solo immagini).")
+            else:
+                _doc_link = r2_upload(_file_bytes, doc_upload.name, R2_BUCKET_ADDESTRAMENTO, R2_PUBLIC_URL_ADDESTRAMENTO)
+                if save_knowledge_document(doc_upload.name, _testo_estratto, _doc_link):
+                    st.success(f"Documento '{doc_upload.name}' aggiunto ai documenti di addestramento.")
+                    st.rerun()
+                else:
+                    st.error("Errore nel salvataggio del documento nel database.")
+
+        _documenti_esistenti = list_knowledge_documents() if _supabase_enabled() else []
+        if _documenti_esistenti:
+            st.caption(f"Documenti caricati ({len(_documenti_esistenti)}):")
+            for _doc in _documenti_esistenti:
+                _col1, _col2 = st.columns([4, 1])
+                with _col1:
+                    if _doc.get("file_url"):
+                        st.markdown(f"📄 [{_doc['filename']}]({_doc['file_url']})")
+                    else:
+                        st.markdown(f"📄 {_doc['filename']}")
+                with _col2:
+                    if st.button("🗑️", key=f"del_doc_{_doc['id']}", help="Rimuovi questo documento"):
+                        delete_knowledge_document(_doc["id"])
+                        st.rerun()
+
+    if IS_PARENT:
+        st.markdown("---")
         st.markdown("#### 📊 Graphify — statistiche")
         if MEMORIA_PERSISTENTE:
             try:
@@ -875,12 +1046,12 @@ with st.sidebar:
             st.caption("I grafici dettagliati richiedono la memoria persistente su database (Supabase), attualmente attiva. Se non e raggiungibile, qui non vedrai dati.")
 
     st.markdown("---")
-    st.markdown("#### 📎 Allegati (Google Drive)")
-    ALLEGATI_ATTIVI = _gdrive_enabled()
+    st.markdown("#### 📎 Allegati")
+    ALLEGATI_ATTIVI = _r2_enabled()
     if ALLEGATI_ATTIVI:
-        st.caption("Gli allegati inviati dalla chat vengono salvati su Google Drive.")
+        st.caption("Gli allegati inviati dalla chat vengono salvati in modo permanente nello spazio dedicato.")
     else:
-        st.caption("Il salvataggio su Google Drive non e ancora configurato: gli allegati verranno comunque accettati ma non salvati in modo permanente, finche non vengono aggiunte le credenziali Google Drive.")
+        st.caption("Il salvataggio permanente degli allegati non e ancora configurato: gli allegati verranno comunque accettati nella chat ma non salvati, finche non vengono aggiunte le credenziali dello spazio di archiviazione.")
 
     if IS_PARENT and MEMORIA_PERSISTENTE:
         st.markdown("---")
@@ -975,11 +1146,11 @@ else:
 
         for f in (user_input.files or []):
             file_bytes = f.getvalue()
-            gdrive_link = gdrive_upload(file_bytes, f.name)
-            if gdrive_link is not None:
-                notes.append(f"[Allegato salvato su Google Drive: {f.name} ({gdrive_link})]")
+            r2_link = r2_upload(file_bytes, f.name, R2_BUCKET_ALLEGATI, R2_PUBLIC_URL_ALLEGATI)
+            if r2_link is not None:
+                notes.append(f"[Allegato salvato: {f.name} ({r2_link})]")
             else:
-                notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche Google Drive non e ancora configurato o non e raggiungibile]")
+                notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche lo spazio di archiviazione non e ancora configurato o non e raggiungibile]")
 
         if notes:
             prompt = (prompt + "\n\n" + "\n".join(notes)).strip() if prompt else "\n".join(notes)
