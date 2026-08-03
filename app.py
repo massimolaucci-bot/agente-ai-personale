@@ -186,6 +186,107 @@ def save_memory(messages):
     _save_memory_file(messages)
 
 
+# --- Conversazioni archiviate (una lista di chat separate, come nelle altre AI) --
+# Ogni volta che si entra nella chat (dopo il login) si riparte da una conversazione
+# nuova e vuota; le conversazioni precedenti restano salvate e consultabili dalla
+# barra laterale. Richiede la memoria persistente su Supabase (tabella
+# "conversations", collegata a "chat_messages" tramite conversation_id): senza
+# database esterno l'app torna al comportamento precedente (una sola cronologia
+# condivisa, senza archivio).
+def _create_conversation(user_name, title=None):
+    if not _supabase_enabled():
+        return None
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/conversations",
+            headers={**SUPABASE_HEADERS, "Prefer": "return=representation"},
+            json={"user_name": user_name, "title": title},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0]["id"] if rows else None
+    except Exception:
+        return None
+
+
+def _list_conversations(user_name, limit=30):
+    if not _supabase_enabled():
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/conversations",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "id,title,created_at",
+                "user_name": f"eq.{user_name}",
+                "order": "id.desc",
+                "limit": str(limit),
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
+def _update_conversation_title(conversation_id, title):
+    if not _supabase_enabled() or conversation_id is None:
+        return
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/conversations",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{conversation_id}"},
+            json={"title": title},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+    except Exception:
+        pass
+
+
+def _load_conversation_messages(conversation_id):
+    if not _supabase_enabled() or conversation_id is None:
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/chat_messages",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "role,content",
+                "conversation_id": f"eq.{conversation_id}",
+                "order": "id.asc",
+                "limit": str(MAX_SAVED_MESSAGES),
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return [{"role": row["role"], "content": row["content"]} for row in r.json()]
+    except Exception:
+        return []
+
+
+def _append_message(conversation_id, role, content):
+    """Salva un singolo messaggio nella conversazione indicata. A differenza di
+    save_memory() (che cancella e riscrive tutta la cronologia condivisa), qui si
+    aggiunge una sola riga: conversazioni diverse convivono nello stesso database
+    senza cancellarsi a vicenda."""
+    if not _supabase_enabled() or conversation_id is None:
+        return
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/chat_messages",
+            headers=SUPABASE_HEADERS,
+            json={"role": role, "content": content, "conversation_id": conversation_id},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+    except Exception:
+        pass
+
+
 def load_knowledge():
     if _supabase_enabled():
         try:
@@ -651,6 +752,13 @@ if st.session_state.get("just_logged_in"):
     with _col2:
         if st.button("Entra nella chat →", use_container_width=True, type="primary"):
             st.session_state.just_logged_in = False
+            # Ogni ingresso in chat riparte da una conversazione nuova e vuota:
+            # quelle precedenti restano salvate e consultabili dalla barra
+            # laterale ("Conversazioni precedenti"), esattamente come nelle
+            # altre app di intelligenza artificiale.
+            if MEMORIA_PERSISTENTE:
+                st.session_state.conversation_id = _create_conversation(_nome_utente)
+            st.session_state.messages = []
             st.rerun()
     st.stop()
 
@@ -668,10 +776,34 @@ with st.sidebar:
     else:
         st.caption("La cronologia mostrata resta finche il server e attivo; al modello viene inviata solo la parte piu recente per evitare errori. Se Render riavvia il servizio, tutto si azzera (database esterno non configurato).")
 
-    if IS_PARENT and st.button("Nuova conversazione"):
+    if st.button("➕ Nuova conversazione", use_container_width=True):
+        if MEMORIA_PERSISTENTE:
+            st.session_state.conversation_id = _create_conversation(
+                st.session_state.current_user.get("name", "Utente")
+            )
+        else:
+            save_memory([])
         st.session_state.messages = []
-        save_memory([])
         st.rerun()
+
+    if MEMORIA_PERSISTENTE:
+        st.markdown("---")
+        st.markdown("#### 🗂️ Conversazioni precedenti")
+        _conversazioni = _list_conversations(st.session_state.current_user.get("name", "Utente"))
+        _conv_attiva = st.session_state.get("conversation_id")
+        if not _conversazioni:
+            st.caption("Nessuna conversazione precedente ancora.")
+        else:
+            for _conv in _conversazioni:
+                _titolo = _conv.get("title") or "Nuova conversazione"
+                if len(_titolo) > 34:
+                    _titolo = _titolo[:34] + "…"
+                _data = (_conv.get("created_at") or "")[:16].replace("T", " ")
+                _etichetta = f"{'🔵 ' if _conv['id'] == _conv_attiva else ''}{_titolo}"
+                if st.button(_etichetta, key=f"conv_{_conv['id']}", help=_data, use_container_width=True):
+                    st.session_state.conversation_id = _conv["id"]
+                    st.session_state.messages = _load_conversation_messages(_conv["id"])
+                    st.rerun()
 
     st.markdown("---")
     st.markdown("#### Risposte vocali")
@@ -766,8 +898,21 @@ if not groq_api_key:
 else:
     client = Groq(api_key=groq_api_key)
 
+    if "conversation_id" not in st.session_state:
+        st.session_state.conversation_id = None
+    if MEMORIA_PERSISTENTE and st.session_state.conversation_id is None:
+        # Rete di sicurezza: se per qualche motivo si arriva qui senza essere
+        # passati dalla pagina di benvenuto (che crea normalmente la nuova
+        # conversazione), ne creiamo comunque una invece di lasciare la chat
+        # senza un posto dove salvare i messaggi.
+        st.session_state.conversation_id = _create_conversation(
+            st.session_state.current_user.get("name", "Utente")
+        )
     if "messages" not in st.session_state:
-        st.session_state.messages = load_memory()
+        if MEMORIA_PERSISTENTE:
+            st.session_state.messages = _load_conversation_messages(st.session_state.conversation_id)
+        else:
+            st.session_state.messages = load_memory()
     if "knowledge_text" not in st.session_state:
         st.session_state.knowledge_text = load_knowledge()
 
@@ -828,7 +973,15 @@ else:
 
     if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
-        save_memory(st.session_state.messages)
+        if MEMORIA_PERSISTENTE:
+            _era_conversazione_vuota = len(st.session_state.messages) == 1
+            _append_message(st.session_state.conversation_id, "user", prompt)
+            if _era_conversazione_vuota:
+                _righe = prompt.strip().splitlines()
+                _titolo_breve = (_righe[0][:60] if _righe else "Nuova conversazione")
+                _update_conversation_title(st.session_state.conversation_id, _titolo_breve)
+        else:
+            save_memory(st.session_state.messages)
         with st.chat_message("user"):
             st.markdown(prompt)
 
@@ -874,7 +1027,10 @@ else:
             if response is not None:
                 st.markdown(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
-                save_memory(st.session_state.messages)
+                if MEMORIA_PERSISTENTE:
+                    _append_message(st.session_state.conversation_id, "assistant", response)
+                else:
+                    save_memory(st.session_state.messages)
 
                 if st.session_state.get("tts_enabled", True):
                     tts_script = f"""
