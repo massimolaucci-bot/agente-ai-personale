@@ -4,6 +4,7 @@ import hashlib
 import requests
 import streamlit as st
 from groq import Groq
+from datetime import datetime
 
 MEMORY_FILE = "chat_memory.json"
 KNOWLEDGE_FILE = "knowledge.json"
@@ -207,6 +208,16 @@ def _hash_pin(pin):
     return hashlib.sha256((str(pin) + "carpanet_family_salt_v1").encode("utf-8")).hexdigest()
 
 
+def _saluto_orario():
+    ora = datetime.now().hour
+    if ora < 12:
+        return "buongiorno"
+    elif ora < 18:
+        return "buon pomeriggio"
+    else:
+        return "buonasera"
+
+
 def _load_family_users():
     if not _supabase_enabled():
         return []
@@ -378,6 +389,7 @@ if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
                 if new_name.strip() and new_pin.strip():
                     if _create_family_user(new_name.strip(), new_pin.strip(), "genitore"):
                         st.session_state.current_user = {"name": new_name.strip(), "role": "genitore"}
+                        st.session_state.just_logged_in = True
                         st.rerun()
                     else:
                         st.error("Errore nella creazione dell'account. Riprova.")
@@ -393,6 +405,7 @@ if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
                 user = _verify_family_login(selected_name, pin_input)
                 if user:
                     st.session_state.current_user = user
+                    st.session_state.just_logged_in = True
                     st.rerun()
                 else:
                     st.error("PIN errato.")
@@ -521,6 +534,11 @@ else:
         st.session_state.messages = load_memory()
     if "knowledge_text" not in st.session_state:
         st.session_state.knowledge_text = load_knowledge()
+
+    if st.session_state.get("just_logged_in"):
+        nome_utente = st.session_state.current_user.get("name", "")
+        st.success(f"👋 Ciao {nome_utente}, {_saluto_orario()}!")
+        st.session_state.just_logged_in = False
 
     # Nota tecnica: Streamlit 1.60 supporta nativamente allegati (accept_file) e
     # registrazione vocale (accept_audio) direttamente dentro st.chat_input, con
