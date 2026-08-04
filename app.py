@@ -469,14 +469,19 @@ def save_knowledge(text):
 # arriva una domanda, si cerca automaticamente nei documenti con la ricerca
 # full-text nativa di Postgres (nessun servizio esterno, nessuna chiave API in
 # piu, nessun rischio di cancellazione dati come con un database a grafo).
-def save_knowledge_document(filename, content_text, file_url):
+def save_knowledge_document(filename, content_text, file_url, user_name=None):
+    """user_name=None salva nel livello generale/condiviso (visibile e usato da
+    tutta la famiglia, modificabile solo dai genitori). Un user_name valorizzato
+    salva invece nella memoria PERSONALE di quell'account (usata solo nelle sue
+    conversazioni, oltre a quella condivisa), visibile anche ai genitori tramite
+    la sezione di supervisione dedicata."""
     if not _supabase_enabled():
         return False
     try:
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/knowledge_documents",
             headers=SUPABASE_HEADERS,
-            json={"filename": filename, "content_text": content_text, "file_url": file_url},
+            json={"filename": filename, "content_text": content_text, "file_url": file_url, "user_name": user_name},
             timeout=SUPABASE_TIMEOUT,
         )
         r.raise_for_status()
@@ -486,14 +491,19 @@ def save_knowledge_document(filename, content_text, file_url):
         return False
 
 
-def list_knowledge_documents(limit=50):
+def list_knowledge_documents(limit=50, user_name=None):
+    """user_name=None elenca il livello generale/condiviso (user_name NULL nel
+    database). Un user_name valorizzato elenca invece solo la memoria personale
+    di quell'account."""
     if not _supabase_enabled():
         return []
     try:
+        params = {"select": "id,filename,file_url,created_at", "order": "id.desc", "limit": str(limit)}
+        params["user_name"] = "is.null" if user_name is None else f"eq.{user_name}"
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/knowledge_documents",
             headers=SUPABASE_HEADERS,
-            params={"select": "id,filename,file_url,created_at", "order": "id.desc", "limit": str(limit)},
+            params=params,
             timeout=SUPABASE_TIMEOUT,
         )
         r.raise_for_status()
@@ -517,11 +527,15 @@ def delete_knowledge_document(doc_id):
         pass
 
 
-def search_knowledge_documents(query_text, limit=3):
+def search_knowledge_documents(query_text, user_name=None, limit=3):
     """Cerca nei documenti di addestramento caricati i passaggi piu pertinenti
     rispetto al messaggio dell'utente, usando la ricerca full-text nativa di
     Postgres (via Supabase REST). Ritorna una lista vuota se non ci sono
-    corrispondenze o il database non e raggiungibile: non blocca mai la chat."""
+    corrispondenze o il database non e raggiungibile: non blocca mai la chat.
+    Include sempre i documenti del livello condiviso (user_name NULL) e, se
+    user_name e' indicato, anche quelli della memoria personale di
+    quell'account: cosi ogni utente vede in automatico le istruzioni generali
+    di famiglia PIU le proprie, senza mai vedere quelle personali di altri."""
     if not _supabase_enabled() or not query_text or not query_text.strip():
         return []
     try:
@@ -531,14 +545,19 @@ def search_knowledge_documents(query_text, limit=3):
         if not parole:
             return []
         query_fts = " | ".join(parole)
+        params = {
+            "select": "filename,content_text",
+            "content_text": f"fts(italian).{query_fts}",
+            "limit": str(limit),
+        }
+        if user_name:
+            params["or"] = f"(user_name.is.null,user_name.eq.{user_name})"
+        else:
+            params["user_name"] = "is.null"
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/knowledge_documents",
             headers=SUPABASE_HEADERS,
-            params={
-                "select": "filename,content_text",
-                "content_text": f"fts(italian).{query_fts}",
-                "limit": str(limit),
-            },
+            params=params,
             timeout=SUPABASE_TIMEOUT,
         )
         r.raise_for_status()
@@ -572,9 +591,16 @@ def _testo_comando_addestramento(testo):
     return resto
 
 
-def _gestisci_addestramento(resto_testo, files, user_name):
+def _gestisci_addestramento(resto_testo, files, user_name, is_parent):
     """Salva testo e/o file (documenti, foto) come materiale di addestramento
-    permanente. Ritorna il messaggio da mostrare come risposta dell'assistente."""
+    permanente. Ritorna il messaggio da mostrare come risposta dell'assistente.
+
+    Un genitore che scrive "addestramento" aggiorna il livello generale,
+    condiviso con tutta la famiglia (comportamento invariato). Un figlio che
+    scrive "addestramento" aggiorna invece la propria memoria PERSONALE: resta
+    valida solo nelle sue conversazioni (oltre a quella generale dei genitori),
+    cosi non deve piu ripetere ogni volta chi e o le sue preferenze, ma non puo
+    in nessun caso modificare le istruzioni generali di famiglia."""
     if not resto_testo and not files:
         return (
             "Certo! Per l'addestramento scrivi (o dettami) il testo subito dopo "
@@ -582,6 +608,7 @@ def _gestisci_addestramento(resto_testo, files, user_name):
             "quello che vuoi che ricordi sempre."
         )
 
+    scope_user_name = None if is_parent else user_name
     salvati = []
     errori = []
 
@@ -606,22 +633,23 @@ def _gestisci_addestramento(resto_testo, files, user_name):
                 contenuto = f"[File caricato per l'addestramento: {nome}, non e stato possibile estrarne il testo]"
 
         link = r2_upload(file_bytes, nome, R2_BUCKET_ADDESTRAMENTO, R2_PUBLIC_URL_ADDESTRAMENTO)
-        if save_knowledge_document(nome, contenuto, link):
+        if save_knowledge_document(nome, contenuto, link, user_name=scope_user_name):
             salvati.append(nome)
         else:
             errori.append(nome)
 
     if not files and resto_testo:
         nome_nota = f"nota_{user_name}_{int(datetime.now().timestamp())}.txt"
-        if save_knowledge_document(nome_nota, resto_testo, None):
+        if save_knowledge_document(nome_nota, resto_testo, None, user_name=scope_user_name):
             salvati.append("una nota di testo")
         else:
             errori.append("la nota di testo")
 
     parti = []
     if salvati:
+        dove = "nella tua memoria personale" if scope_user_name else "nella memoria di addestramento generale"
         parti.append(
-            "Ho salvato nella memoria di addestramento: " + ", ".join(salvati)
+            f"Ho salvato {dove}: " + ", ".join(salvati)
             + ". Da ora in poi ne terro' conto quando mi fai domande pertinenti."
         )
     if errori:
@@ -634,6 +662,75 @@ def _gestisci_addestramento(resto_testo, files, user_name):
             "configurato del tutto, quindi il salvataggio potrebbe non essere permanente."
         )
     return " ".join(parti)
+
+
+def _render_gestione_documenti_addestramento(scope_user_name, key_prefix):
+    """Disegna il caricatore multi-file + l'elenco con cancellazione dei
+    documenti di addestramento per un livello specifico: scope_user_name=None
+    per il livello generale/condiviso, oppure il nome di un account per la sua
+    memoria personale. Riusata in tre punti della barra laterale (livello
+    generale per i genitori, memoria personale propria per i figli, e
+    supervisione dei genitori sulla memoria personale di ciascun figlio), cosi
+    la logica di caricamento/elenco/cancellazione resta identica ovunque."""
+    _addestramento_attivo = _r2_enabled() and _supabase_enabled()
+    doc_uploads = st.file_uploader(
+        "Carica documenti",
+        type=["pdf", "docx"],
+        label_visibility="collapsed",
+        key=f"doc_uploader_{key_prefix}",
+        disabled=not _addestramento_attivo,
+        accept_multiple_files=True,
+    )
+    _num_da_caricare = len(doc_uploads) if doc_uploads else 0
+    _etichetta_bottone = (
+        f"Aggiungi {_num_da_caricare} documenti"
+        if _num_da_caricare > 1
+        else "Aggiungi documento"
+    )
+    if _num_da_caricare > 0 and st.button(_etichetta_bottone, key=f"btn_upload_{key_prefix}", disabled=not _addestramento_attivo):
+        _riusciti = []
+        _falliti = []
+        with st.spinner(f"Carico {_num_da_caricare} documento/i..."):
+            for _doc in doc_uploads:
+                _file_bytes = _doc.getvalue()
+                if _doc.name.lower().endswith(".pdf"):
+                    _testo_estratto = _extract_pdf_text(_file_bytes)
+                else:
+                    _testo_estratto = _extract_docx_text(_file_bytes)
+                if not _testo_estratto:
+                    _falliti.append((_doc.name, "contenuto non leggibile (forse un PDF scansionato senza testo selezionabile)"))
+                    continue
+                _doc_link = r2_upload(_file_bytes, _doc.name, R2_BUCKET_ADDESTRAMENTO, R2_PUBLIC_URL_ADDESTRAMENTO)
+                if save_knowledge_document(_doc.name, _testo_estratto, _doc_link, user_name=scope_user_name):
+                    _riusciti.append(_doc.name)
+                else:
+                    _falliti.append((_doc.name, "errore nel salvataggio nel database"))
+        if _riusciti:
+            if len(_riusciti) == 1:
+                st.success(f"Documento '{_riusciti[0]}' aggiunto.")
+            else:
+                st.success(f"{len(_riusciti)} documenti aggiunti: {', '.join(_riusciti)}.")
+        for _nome, _motivo in _falliti:
+            st.error(f"'{_nome}' non caricato: {_motivo}.")
+        if _riusciti:
+            st.rerun()
+
+    _documenti_esistenti = list_knowledge_documents(user_name=scope_user_name) if _supabase_enabled() else []
+    if _documenti_esistenti:
+        st.caption(f"Documenti caricati ({len(_documenti_esistenti)}):")
+        for _doc in _documenti_esistenti:
+            _col1, _col2 = st.columns([4, 1])
+            with _col1:
+                if _doc.get("file_url"):
+                    st.markdown(f"📄 [{_doc['filename']}]({_doc['file_url']})")
+                else:
+                    st.markdown(f"📄 {_doc['filename']}")
+            with _col2:
+                if st.button("🗑️", key=f"del_doc_{key_prefix}_{_doc['id']}", help="Rimuovi questo documento"):
+                    delete_knowledge_document(_doc["id"])
+                    st.rerun()
+    else:
+        st.caption("Nessun documento caricato per ora.")
 
 
 # --- Login familiare e ruoli (genitore = accesso completo, figlio = limitato) --
@@ -759,7 +856,7 @@ def _create_family_user(name, pin, role):
         return False
 
 
-def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None, location_text=None):
+def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None, location_text=None, current_user_name=None):
     history_limit = history_limit or MAX_HISTORY_MESSAGES
     char_limit = char_limit or MAX_MESSAGE_CHARS
 
@@ -782,8 +879,10 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
     # passaggi piu' pertinenti rispetto all'ultima domanda e li aggiunge come
     # contesto, cosi' l'AI puo' usarli per rispondere senza doverli leggere
     # sempre tutti per intero.
+    # Ogni utente vede automaticamente i documenti generali di famiglia PIU i
+    # propri personali (mai quelli personali di altri account).
     ultimo_messaggio_utente = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
-    estratti_documenti = search_knowledge_documents(ultimo_messaggio_utente)
+    estratti_documenti = search_knowledge_documents(ultimo_messaggio_utente, user_name=current_user_name)
     if estratti_documenti:
         system_prompt += "\n\nEstratti rilevanti dai documenti caricati dall'utente (usali se utili per rispondere):\n"
         for doc in estratti_documenti:
@@ -895,8 +994,17 @@ components.html("""
         return new TextDecoder('utf-8').decode(bytes);
     }
 
-    function leggi(bottone) {
-        var testo = decodificaB64Utf8(bottone.getAttribute('data-b64'));
+    // Chrome (desktop e Android) ha un bug noto e molto diffuso: se si chiama
+    // speak() troppo a ridosso di un cancel() (nello stesso istante), oppure
+    // se il motore di sintesi vocale e' rimasto "fermo" per qualche secondo
+    // dopo l'ultima lettura, le chiamate successive a speak() possono fallire
+    // in silenzio (nessun audio, nessun evento onstart/onend: il pulsante
+    // resta come "bloccato"). Questo e' esattamente il comportamento
+    // descritto: la prima lettura funziona, quelle dopo no. Il rimedio
+    // raccomandato e' annullare sempre prima, aspettare un istante brevissimo
+    // e SOLO DOPO avviare la nuova lettura (mai speak() subito dopo cancel()
+    // nello stesso istante).
+    function avvia(bottone, testo) {
         var utterance = new topWin.SpeechSynthesisUtterance(testo);
         utterance.lang = 'it-IT';
         utterance.onend = function() {
@@ -906,8 +1014,15 @@ components.html("""
             if (corrente.bottone === bottone) { bottone.textContent = '🔊'; corrente.bottone = null; }
         };
         corrente.bottone = bottone;
+        corrente.utterance = utterance;
         bottone.textContent = '⏸️';
         synth.speak(utterance);
+    }
+
+    function leggi(bottone) {
+        var testo = decodificaB64Utf8(bottone.getAttribute('data-b64'));
+        synth.cancel();
+        setTimeout(function() { avvia(bottone, testo); }, 80);
     }
 
     doc.addEventListener('click', function(ev) {
@@ -915,33 +1030,55 @@ components.html("""
         if (!bottone) { return; }
         ev.preventDefault();
 
-        if (corrente.bottone === bottone) {
-            // Stesso pulsante: alterna pausa / riprendi.
+        if (corrente.bottone === bottone && (synth.speaking || synth.paused)) {
+            // Stesso pulsante, lettura in corso o in pausa: alterna pausa / riprendi.
             if (synth.paused) {
                 synth.resume();
                 bottone.textContent = '⏸️';
-            } else if (synth.speaking) {
+            } else {
                 synth.pause();
                 bottone.textContent = '▶️';
-            } else {
-                leggi(bottone);
             }
             return;
         }
 
-        if (corrente.bottone) { corrente.bottone.textContent = '🔊'; }
-        synth.cancel();
+        // Pulsante nuovo, oppure stesso pulsante ma la lettura precedente e'
+        // gia' terminata (si riparte da capo): ferma tutto e avvia quella
+        // nuova, sempre passando dal cancel() + piccola attesa di leggi().
+        if (corrente.bottone && corrente.bottone !== bottone) {
+            corrente.bottone.textContent = '🔊';
+        }
         leggi(bottone);
     });
+
+    // "Sblocco" del motore vocale al primissimo tocco/click sulla pagina:
+    // su alcuni browser (soprattutto mobile) la sintesi vocale resta
+    // silenziosa finche' non viene "attivata" da un gesto dell'utente. Con
+    // un'utterance vuota, innocua e silenziosa, ci assicuriamo che il motore
+    // sia gia' pronto quando l'utente preme per la prima volta il pulsante
+    // di lettura o fa una domanda a voce.
+    var sbloccato = false;
+    function sbloccaMotoreVocale() {
+        if (sbloccato) { return; }
+        sbloccato = true;
+        try {
+            var muto = new topWin.SpeechSynthesisUtterance('');
+            synth.speak(muto);
+        } catch (e) { /* ignorato: non e' critico */ }
+    }
+    doc.addEventListener('click', sbloccaMotoreVocale, { once: true, capture: true });
+    doc.addEventListener('touchstart', sbloccaMotoreVocale, { once: true, capture: true });
 
     // Lettura automatica (dopo una domanda fatta a voce): interrompe quella in
     // corso, se c'e', e legge la nuova risposta.
     topWin.__carpanetSpeak = function(testo) {
         if (corrente.bottone) { corrente.bottone.textContent = '🔊'; corrente.bottone = null; }
         synth.cancel();
-        var utterance = new topWin.SpeechSynthesisUtterance(testo);
-        utterance.lang = 'it-IT';
-        synth.speak(utterance);
+        setTimeout(function() {
+            var utterance = new topWin.SpeechSynthesisUtterance(testo);
+            utterance.lang = 'it-IT';
+            synth.speak(utterance);
+        }, 80);
     };
     // Interrompe qualunque lettura in corso senza avviarne una nuova: usato
     // quando arriva un nuovo messaggio (scritto o vocale) mentre l'assistente
@@ -950,6 +1087,58 @@ components.html("""
         synth.cancel();
         if (corrente.bottone) { corrente.bottone.textContent = '🔊'; corrente.bottone = null; }
     };
+})();
+</script>
+""", height=0)
+
+# --- Correzione bug nativo di Streamlit: pulsante microfono "rotto" al primo
+# caricamento ---------------------------------------------------------------
+# Cio' che l'utente ha descritto ("appena si scrive qualcosa il microfono si
+# sistema da solo") e' in realta' un piccolo bug di Streamlit stesso: quando
+# la pagina si apre, il controllo interno che verifica se la registrazione
+# vocale e' disponibile a volte non fa in tempo a concludersi prima del primo
+# disegno della casella di testo, e il pulsante del microfono resta bloccato
+# nello stato di errore "Recording failed" (icona diventata un pallino pieno
+# con un punto esclamativo, invece del microfono). Quel controllo viene
+# rifatto correttamente solo quando il contenuto della casella cambia (per
+# questo basta scrivere una lettera qualsiasi per "sbloccarlo"). Qui
+# automatizziamo la stessa correzione appena la pagina e' pronta: scriviamo e
+# cancelliamo subito, senza che l'utente se ne accorga, un carattere
+# invisibile nella casella di testo (solo se e' ancora vuota), cosi'
+# l'icona del microfono e la forma della casella sono gia' corrette fin dal
+# primo istante, senza dover scrivere nulla.
+components.html("""
+<script>
+(function() {
+    var topWin = window.parent || window;
+    var doc = topWin.document;
+    if (!doc.body || doc.body.dataset.carpanetMicFixBound) { return; }
+    doc.body.dataset.carpanetMicFixBound = '1';
+
+    var tentativi = 0;
+    var intervallo = setInterval(function() {
+        tentativi++;
+        var textarea = doc.querySelector('[data-testid="stChatInputTextArea"]');
+        if (textarea && !textarea.disabled) {
+            clearInterval(intervallo);
+            if (textarea.value !== '') { return; }
+            try {
+                var setter = Object.getOwnPropertyDescriptor(
+                    topWin.HTMLTextAreaElement.prototype, 'value'
+                ).set;
+                setter.call(textarea, ' ');
+                textarea.dispatchEvent(new topWin.Event('input', { bubbles: true }));
+                setTimeout(function() {
+                    if (textarea.value === ' ') {
+                        setter.call(textarea, '');
+                        textarea.dispatchEvent(new topWin.Event('input', { bubbles: true }));
+                    }
+                }, 150);
+            } catch (e) { /* in caso di problemi non blocchiamo la pagina */ }
+            return;
+        }
+        if (tentativi > 30) { clearInterval(intervallo); }
+    }, 300);
 })();
 </script>
 """, height=0)
@@ -1000,6 +1189,15 @@ html, body {{
 [data-testid="stChatInputTextArea"]::placeholder {{
     color: #a9b8d6 !important;
     opacity: 1 !important;
+    /* Il testo del placeholder, se troppo lungo per lo schermo, andava a capo
+       su piu' righe (fino a 3 su cellulare) e la casella di testo si
+       allargava in verticale per contenerle, sembrando "quadrata" invece
+       della normale forma a pillola. Qui lo teniamo su una riga sola e lo
+       tronchiamo con i puntini: la casella resta sempre della stessa altezza
+       compatta, sia vuota che con testo scritto dentro. */
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
 }}
 /* Icone native di st.chat_input (allega file, microfono, invia):
    NON forziamo background, border-radius, fill o stroke sugli SVG.
@@ -1389,51 +1587,54 @@ with st.sidebar:
             st.session_state.knowledge_text = knowledge_input
             st.success("Istruzioni salvate.")
 
+    _addestramento_attivo = _r2_enabled() and _supabase_enabled()
+
     if IS_PARENT:
         st.markdown("---")
-        st.markdown("#### 📚 Documenti di addestramento (PDF/Word)")
-        _addestramento_attivo = _r2_enabled() and _supabase_enabled()
+        st.markdown("#### 📚 Addestramento generale (condiviso)")
         if _addestramento_attivo:
-            st.caption("Carica un PDF o un Word: il contenuto viene letto e usato automaticamente da Carpanet AI per rispondere alle domande pertinenti, in modo permanente.")
+            st.caption(
+                "Carica uno o piu PDF/Word insieme: il contenuto viene letto e usato automaticamente da "
+                "Carpanet AI per rispondere alle domande pertinenti, in modo permanente, a TUTTA la famiglia. "
+                "Puoi selezionarne tanti insieme dalla finestra di scelta file (tenendo premuto Ctrl o Cmd), "
+                "oppure trascinarli qui tutti insieme: apri la cartella con i documenti, seleziona tutti i "
+                "file al suo interno (Ctrl+A o Cmd+A) e trascina la selezione qui sopra. Nota: i browser non "
+                "permettono di trascinare direttamente l'icona di una cartella intera, ma selezionare e "
+                "trascinare tutti i file al suo interno funziona allo stesso modo."
+            )
         else:
             st.caption("Funzione non ancora attiva: manca la configurazione dello spazio di archiviazione dedicato all'addestramento.")
-        doc_upload = st.file_uploader(
-            "Carica documento",
-            type=["pdf", "docx"],
-            label_visibility="collapsed",
-            key="doc_uploader",
-            disabled=not _addestramento_attivo,
-        )
-        if doc_upload is not None and st.button("Aggiungi ai documenti di addestramento", disabled=not _addestramento_attivo):
-            _file_bytes = doc_upload.getvalue()
-            if doc_upload.name.lower().endswith(".pdf"):
-                _testo_estratto = _extract_pdf_text(_file_bytes)
-            else:
-                _testo_estratto = _extract_docx_text(_file_bytes)
-            if not _testo_estratto:
-                st.error("Non sono riuscito a leggere il contenuto del file. Controlla che non sia un PDF scansionato senza testo selezionabile (solo immagini).")
-            else:
-                _doc_link = r2_upload(_file_bytes, doc_upload.name, R2_BUCKET_ADDESTRAMENTO, R2_PUBLIC_URL_ADDESTRAMENTO)
-                if save_knowledge_document(doc_upload.name, _testo_estratto, _doc_link):
-                    st.success(f"Documento '{doc_upload.name}' aggiunto ai documenti di addestramento.")
-                    st.rerun()
-                else:
-                    st.error("Errore nel salvataggio del documento nel database.")
+        _render_gestione_documenti_addestramento(None, "shared")
+    else:
+        st.markdown("---")
+        st.markdown("#### 📚 La tua memoria personale")
+        if _addestramento_attivo:
+            st.caption(
+                "Carica qui uno o piu PDF/Word (anche piu' di uno insieme) con le cose che vuoi che Carpanet AI "
+                "ricordi sempre quando parla con te: restano valide in aggiunta alle istruzioni generali di "
+                "famiglia. Puoi anche scrivere \"addestramento\" in chat seguito da quello che vuoi ricordi."
+            )
+        else:
+            st.caption("Funzione non ancora attiva: manca la configurazione dello spazio di archiviazione dedicato all'addestramento.")
+        _render_gestione_documenti_addestramento(st.session_state.current_user.get("name"), "own")
 
-        _documenti_esistenti = list_knowledge_documents() if _supabase_enabled() else []
-        if _documenti_esistenti:
-            st.caption(f"Documenti caricati ({len(_documenti_esistenti)}):")
-            for _doc in _documenti_esistenti:
-                _col1, _col2 = st.columns([4, 1])
-                with _col1:
-                    if _doc.get("file_url"):
-                        st.markdown(f"📄 [{_doc['filename']}]({_doc['file_url']})")
-                    else:
-                        st.markdown(f"📄 {_doc['filename']}")
-                with _col2:
-                    if st.button("🗑️", key=f"del_doc_{_doc['id']}", help="Rimuovi questo documento"):
-                        delete_knowledge_document(_doc["id"])
-                        st.rerun()
+    if IS_PARENT and MEMORIA_PERSISTENTE:
+        st.markdown("---")
+        with st.expander("🧒 Memoria personale dei figli"):
+            st.caption(
+                "Ogni figlio puo' personalizzare la propria memoria scrivendo \"addestramento\" in chat: resta "
+                "valida solo nelle sue conversazioni (in aggiunta a quella generale sopra) e non puo' in nessun "
+                "caso modificare le istruzioni generali di famiglia. Da qui puoi vedere e modificare la memoria "
+                "personale di ciascun figlio."
+            )
+            _figli_famiglia = [u for u in _load_family_users() if u.get("role") == "figlio"]
+            if not _figli_famiglia:
+                st.caption("Nessun account 'figlio' creato per ora (puoi aggiungerne uno piu' sotto, in \"Gestione famiglia\").")
+            else:
+                _nomi_figli = [u["name"] for u in _figli_famiglia]
+                _figlio_selezionato = st.selectbox("Figlio", _nomi_figli, key="selezione_figlio_memoria")
+                if _figlio_selezionato:
+                    _render_gestione_documenti_addestramento(_figlio_selezionato, f"child_{_figlio_selezionato}")
 
     if IS_PARENT:
         st.markdown("---")
@@ -1588,14 +1789,12 @@ else:
             # gli allegati vanno quindi nello spazio dedicato all'addestramento,
             # non tra gli allegati occasionali della chat.
             prompt = testo_completo if testo_completo else "addestramento"
-            if not IS_PARENT:
-                risposta_addestramento = "Solo un genitore puo' aggiungere materiale di addestramento, mi dispiace."
-            else:
-                risposta_addestramento = _gestisci_addestramento(
-                    _resto_addestramento,
-                    _file_allegati,
-                    st.session_state.current_user.get("name", "Utente"),
-                )
+            risposta_addestramento = _gestisci_addestramento(
+                _resto_addestramento,
+                _file_allegati,
+                st.session_state.current_user.get("name", "Utente"),
+                IS_PARENT,
+            )
         else:
             notes = []
             if _audio_non_trascritto:
@@ -1663,6 +1862,7 @@ else:
                         st.session_state.messages,
                         st.session_state.get("knowledge_text", ""),
                         location_text=st.session_state.get("user_location"),
+                        current_user_name=st.session_state.current_user.get("name"),
                     )
                     completion = client.chat.completions.create(
                         model=PRIMARY_MODEL,
@@ -1679,6 +1879,7 @@ else:
                                 history_limit=3,
                                 char_limit=600,
                                 location_text=st.session_state.get("user_location"),
+                                current_user_name=st.session_state.current_user.get("name"),
                             )
                             fallback_completion = client.chat.completions.create(
                                 model=FALLBACK_MODEL,
