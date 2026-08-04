@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import hashlib
 import requests
 import streamlit as st
@@ -247,7 +248,7 @@ def _create_conversation(user_name, title=None):
         return None
 
 
-def _list_conversations(user_name, limit=30):
+def _list_conversations(user_name, limit=100):
     if not _supabase_enabled():
         return []
     try:
@@ -255,9 +256,11 @@ def _list_conversations(user_name, limit=30):
             f"{SUPABASE_URL}/rest/v1/conversations",
             headers=SUPABASE_HEADERS,
             params={
-                "select": "id,title,created_at",
+                "select": "id,title,created_at,pinned",
                 "user_name": f"eq.{user_name}",
-                "order": "id.desc",
+                # Le conversazioni "fissate" (pinned) vengono sempre prima,
+                # poi le altre in ordine dalla piu recente.
+                "order": "pinned.desc,id.desc",
                 "limit": str(limit),
             },
             timeout=SUPABASE_TIMEOUT,
@@ -266,6 +269,107 @@ def _list_conversations(user_name, limit=30):
         return r.json()
     except Exception:
         return []
+
+
+def _toggle_pin_conversation(conversation_id, pinned):
+    if not _supabase_enabled() or conversation_id is None:
+        return
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/conversations",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{conversation_id}"},
+            json={"pinned": pinned},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+    except Exception:
+        pass
+
+
+def _delete_conversation(conversation_id):
+    """Cancella una conversazione e (grazie a ON DELETE CASCADE sul database)
+    tutti i suoi messaggi insieme, in un solo passaggio."""
+    if not _supabase_enabled() or conversation_id is None:
+        return
+    try:
+        r = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/conversations",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{conversation_id}"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+    except Exception:
+        pass
+
+
+def _search_conversations(user_name, query_text, limit=100):
+    """Cerca sia nei titoli delle conversazioni sia nel testo dei messaggi al
+    loro interno (ricerca 'ipertestuale' sulla cronologia), e ritorna le
+    conversazioni corrispondenti, con le preferite e le piu recenti prima.
+    Non solleva mai eccezioni: in caso di problemi di rete torna alla lista
+    normale (senza filtro), cosi la barra laterale non si rompe mai."""
+    if not _supabase_enabled():
+        return []
+    query = (query_text or "").strip()
+    if not query:
+        return _list_conversations(user_name, limit=limit)
+    try:
+        r_titoli = requests.get(
+            f"{SUPABASE_URL}/rest/v1/conversations",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "id,title,created_at,pinned",
+                "user_name": f"eq.{user_name}",
+                "title": f"ilike.*{query}*",
+                "order": "pinned.desc,id.desc",
+                "limit": str(limit),
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r_titoli.raise_for_status()
+        trovate = {c["id"]: c for c in r_titoli.json()}
+    except Exception:
+        trovate = {}
+
+    try:
+        r_msg = requests.get(
+            f"{SUPABASE_URL}/rest/v1/chat_messages",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "conversation_id",
+                "content": f"ilike.*{query}*",
+                "limit": "300",
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r_msg.raise_for_status()
+        ids_da_messaggi = {
+            row["conversation_id"] for row in r_msg.json() if row.get("conversation_id") is not None
+        }
+        ids_mancanti = [cid for cid in ids_da_messaggi if cid not in trovate]
+        if ids_mancanti:
+            ids_lista = ",".join(str(i) for i in ids_mancanti)
+            r_conv = requests.get(
+                f"{SUPABASE_URL}/rest/v1/conversations",
+                headers=SUPABASE_HEADERS,
+                params={
+                    "select": "id,title,created_at,pinned",
+                    "user_name": f"eq.{user_name}",
+                    "id": f"in.({ids_lista})",
+                },
+                timeout=SUPABASE_TIMEOUT,
+            )
+            r_conv.raise_for_status()
+            for c in r_conv.json():
+                trovate[c["id"]] = c
+    except Exception:
+        pass
+
+    risultati = list(trovate.values())
+    risultati.sort(key=lambda c: (not c.get("pinned", False), -(c.get("id") or 0)))
+    return risultati[:limit]
 
 
 def _update_conversation_title(conversation_id, title):
@@ -442,6 +546,94 @@ def search_knowledge_documents(query_text, limit=3):
     except Exception as e:
         print(f"[Addestramento] ERRORE ricerca documenti: {type(e).__name__}: {e}", flush=True)
         return []
+
+
+# --- Comando "addestramento" scritto/detto direttamente in chat --------------
+# Se un messaggio (scritto o dettato a voce) inizia con la parola
+# "addestramento", il contenuto che segue (testo, oppure un file/foto/vocale
+# allegato) viene salvato come materiale di addestramento permanente, invece
+# di essere mandato all'AI come una domanda normale. Riusa la stessa
+# infrastruttura gia' esistente per i documenti PDF/Word caricati dalla barra
+# laterale (tabella "knowledge_documents", bucket R2 dedicato).
+IMMAGINI_ADDESTRAMENTO_EXT = (".png", ".jpg", ".jpeg", ".heic", ".webp")
+
+
+def _testo_comando_addestramento(testo):
+    """Se il messaggio inizia con 'addestramento', ritorna il testo che segue
+    (puo' essere una stringa vuota). Altrimenti ritorna None (non e' un
+    comando di addestramento, va trattato come domanda normale)."""
+    if not testo:
+        return None
+    t = testo.strip()
+    if not t.lower().startswith("addestramento"):
+        return None
+    resto = t[len("addestramento"):].strip()
+    resto = resto.lstrip(":").strip()
+    return resto
+
+
+def _gestisci_addestramento(resto_testo, files, user_name):
+    """Salva testo e/o file (documenti, foto) come materiale di addestramento
+    permanente. Ritorna il messaggio da mostrare come risposta dell'assistente."""
+    if not resto_testo and not files:
+        return (
+            "Certo! Per l'addestramento scrivi (o dettami) il testo subito dopo "
+            "\"addestramento\", oppure allega un file, una foto o un vocale con "
+            "quello che vuoi che ricordi sempre."
+        )
+
+    salvati = []
+    errori = []
+
+    for f in files:
+        file_bytes = f.getvalue()
+        nome = f.name
+        estensione = os.path.splitext(nome)[1].lower()
+        if estensione == ".pdf":
+            testo_estratto = _extract_pdf_text(file_bytes)
+        elif estensione in (".doc", ".docx"):
+            testo_estratto = _extract_docx_text(file_bytes)
+        else:
+            testo_estratto = ""
+
+        contenuto = testo_estratto
+        if resto_testo:
+            contenuto = (resto_testo + "\n\n" + contenuto).strip() if contenuto else resto_testo
+        if not contenuto:
+            if estensione in IMMAGINI_ADDESTRAMENTO_EXT:
+                contenuto = f"[Foto caricata per l'addestramento: {nome}, senza testo o descrizione aggiuntiva fornita]"
+            else:
+                contenuto = f"[File caricato per l'addestramento: {nome}, non e stato possibile estrarne il testo]"
+
+        link = r2_upload(file_bytes, nome, R2_BUCKET_ADDESTRAMENTO, R2_PUBLIC_URL_ADDESTRAMENTO)
+        if save_knowledge_document(nome, contenuto, link):
+            salvati.append(nome)
+        else:
+            errori.append(nome)
+
+    if not files and resto_testo:
+        nome_nota = f"nota_{user_name}_{int(datetime.now().timestamp())}.txt"
+        if save_knowledge_document(nome_nota, resto_testo, None):
+            salvati.append("una nota di testo")
+        else:
+            errori.append("la nota di testo")
+
+    parti = []
+    if salvati:
+        parti.append(
+            "Ho salvato nella memoria di addestramento: " + ", ".join(salvati)
+            + ". Da ora in poi ne terro' conto quando mi fai domande pertinenti."
+        )
+    if errori:
+        parti.append("Non sono riuscito a salvare: " + ", ".join(errori) + ".")
+    if not parti:
+        parti.append("Non sono riuscito a salvare nulla per l'addestramento, riprova.")
+    if not (_r2_enabled() and _supabase_enabled()):
+        parti.append(
+            "Nota: lo spazio di archiviazione dedicato all'addestramento non risulta ancora "
+            "configurato del tutto, quindi il salvataggio potrebbe non essere permanente."
+        )
+    return " ".join(parti)
 
 
 # --- Login familiare e ruoli (genitore = accesso completo, figlio = limitato) --
@@ -663,9 +855,101 @@ components.html("""
         addTag('meta', {name: 'viewport', content: 'width=device-width, initial-scale=1, viewport-fit=cover'});
     }
 
+    // Il service worker viene servito dalla radice del sito (vedi serve.py),
+    // non da /app/static/: solo cosi' il suo "scope" di default copre l'intera
+    // app (incluso l'indirizzo principale "/"), requisito che Chrome/Android
+    // controlla per permettere l'installazione vera e propria (altrimenti
+    // compare al massimo un collegamento in stile "segnalibro", non un'app
+    // installata sul serio).
     if ('serviceWorker' in topWin.navigator) {
-        topWin.navigator.serviceWorker.register('/app/static/sw.js').catch(function() {});
+        topWin.navigator.serviceWorker.register('/sw.js', {scope: '/'}).catch(function() {});
     }
+})();
+</script>
+""", height=0)
+
+# --- Lettura ad alta voce delle risposte: pulsante leggi/pausa --------------
+# Un solo script, iniettato una volta sola (controllo "gia' presente" come
+# sopra), che ascolta i click su QUALSIASI pulsante con classe
+# "carpanet-tts-btn" (anche quelli aggiunti dopo, ad ogni rerun di Streamlit,
+# perche' l'ascolto e' "delegato" sul documento intero). Espone anche due
+# funzioni globali (__carpanetSpeak / __carpanetStopSpeaking) usate piu' sotto
+# per la lettura automatica dopo una domanda fatta a voce e per interrompere
+# la lettura quando arriva un nuovo messaggio.
+components.html("""
+<script>
+(function() {
+    var topWin = window.parent || window;
+    var doc = topWin.document;
+    if (!doc.body || doc.body.dataset.carpanetTtsBound) { return; }
+    doc.body.dataset.carpanetTtsBound = '1';
+
+    if (!('speechSynthesis' in topWin)) { return; }
+    var synth = topWin.speechSynthesis;
+    var corrente = { bottone: null };
+
+    function decodificaB64Utf8(b64) {
+        var raw = atob(b64);
+        var bytes = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) { bytes[i] = raw.charCodeAt(i); }
+        return new TextDecoder('utf-8').decode(bytes);
+    }
+
+    function leggi(bottone) {
+        var testo = decodificaB64Utf8(bottone.getAttribute('data-b64'));
+        var utterance = new topWin.SpeechSynthesisUtterance(testo);
+        utterance.lang = 'it-IT';
+        utterance.onend = function() {
+            if (corrente.bottone === bottone) { bottone.textContent = '🔊'; corrente.bottone = null; }
+        };
+        utterance.onerror = function() {
+            if (corrente.bottone === bottone) { bottone.textContent = '🔊'; corrente.bottone = null; }
+        };
+        corrente.bottone = bottone;
+        bottone.textContent = '⏸️';
+        synth.speak(utterance);
+    }
+
+    doc.addEventListener('click', function(ev) {
+        var bottone = ev.target && ev.target.closest ? ev.target.closest('.carpanet-tts-btn') : null;
+        if (!bottone) { return; }
+        ev.preventDefault();
+
+        if (corrente.bottone === bottone) {
+            // Stesso pulsante: alterna pausa / riprendi.
+            if (synth.paused) {
+                synth.resume();
+                bottone.textContent = '⏸️';
+            } else if (synth.speaking) {
+                synth.pause();
+                bottone.textContent = '▶️';
+            } else {
+                leggi(bottone);
+            }
+            return;
+        }
+
+        if (corrente.bottone) { corrente.bottone.textContent = '🔊'; }
+        synth.cancel();
+        leggi(bottone);
+    });
+
+    // Lettura automatica (dopo una domanda fatta a voce): interrompe quella in
+    // corso, se c'e', e legge la nuova risposta.
+    topWin.__carpanetSpeak = function(testo) {
+        if (corrente.bottone) { corrente.bottone.textContent = '🔊'; corrente.bottone = null; }
+        synth.cancel();
+        var utterance = new topWin.SpeechSynthesisUtterance(testo);
+        utterance.lang = 'it-IT';
+        synth.speak(utterance);
+    };
+    // Interrompe qualunque lettura in corso senza avviarne una nuova: usato
+    // quando arriva un nuovo messaggio (scritto o vocale) mentre l'assistente
+    // sta ancora leggendo la risposta precedente.
+    topWin.__carpanetStopSpeaking = function() {
+        synth.cancel();
+        if (corrente.bottone) { corrente.bottone.textContent = '🔊'; corrente.bottone = null; }
+    };
 })();
 </script>
 """, height=0)
@@ -767,6 +1051,26 @@ html, body {{
     margin: 0 auto 1rem auto;
     max-width: 320px;
     width: 100%;
+}}
+/* Pulsante "leggi ad alta voce / pausa" sotto ogni risposta scritta */
+.carpanet-tts-btn {{
+    background: rgba(0, 229, 255, 0.08) !important;
+    border: 1.5px solid #00e5ff !important;
+    color: #00e5ff !important;
+    border-radius: 999px !important;
+    width: 2.1rem;
+    height: 2.1rem;
+    font-size: 1.05rem;
+    line-height: 1;
+    cursor: pointer;
+    margin-top: 0.35rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    filter: drop-shadow(0 0 4px rgba(0, 229, 255, 0.6));
+}}
+.carpanet-tts-btn:hover {{
+    filter: drop-shadow(0 0 8px rgba(0, 229, 255, 0.9));
 }}
 
 /* --- Chat in stile "Claude": testo piu grande, spaziatura generosa, ------- */
@@ -997,30 +1301,72 @@ with st.sidebar:
     if MEMORIA_PERSISTENTE:
         st.markdown("---")
         st.markdown("#### 🗂️ Conversazioni precedenti")
-        _conversazioni = _list_conversations(st.session_state.current_user.get("name", "Utente"))
+        _nome_utente_corrente = st.session_state.current_user.get("name", "Utente")
+        _ricerca_conv = st.text_input(
+            "Cerca nelle conversazioni",
+            placeholder="🔍 Cerca per titolo o contenuto...",
+            label_visibility="collapsed",
+            key="ricerca_conversazioni",
+        )
+        if _ricerca_conv.strip():
+            _conversazioni = _search_conversations(_nome_utente_corrente, _ricerca_conv)
+        else:
+            _conversazioni = _list_conversations(_nome_utente_corrente)
         _conv_attiva = st.session_state.get("conversation_id")
         if not _conversazioni:
-            st.caption("Nessuna conversazione precedente ancora.")
+            st.caption("Nessuna conversazione trovata." if _ricerca_conv.strip() else "Nessuna conversazione precedente ancora.")
         else:
-            for _conv in _conversazioni:
-                _titolo = _conv.get("title") or "Nuova conversazione"
-                if len(_titolo) > 34:
-                    _titolo = _titolo[:34] + "…"
-                _data = (_conv.get("created_at") or "")[:16].replace("T", " ")
-                _etichetta = f"{'🔵 ' if _conv['id'] == _conv_attiva else ''}{_titolo}"
-                if st.button(_etichetta, key=f"conv_{_conv['id']}", help=_data, use_container_width=True):
-                    st.session_state.conversation_id = _conv["id"]
-                    st.session_state.messages = _load_conversation_messages(_conv["id"])
-                    st.rerun()
+            # Contenitore a scorrimento: con tante conversazioni salvate la
+            # barra laterale non si allunga all'infinito, scorre al suo interno.
+            with st.container(height=320):
+                for _conv in _conversazioni:
+                    _titolo = _conv.get("title") or "Nuova conversazione"
+                    if len(_titolo) > 28:
+                        _titolo = _titolo[:28] + "…"
+                    _data = (_conv.get("created_at") or "")[:16].replace("T", " ")
+                    _e_pinnata = bool(_conv.get("pinned"))
+                    _etichetta = f"{'🔵 ' if _conv['id'] == _conv_attiva else ''}{'📌 ' if _e_pinnata else ''}{_titolo}"
+                    _col_a, _col_b, _col_c = st.columns([5, 1, 1])
+                    with _col_a:
+                        if st.button(_etichetta, key=f"conv_{_conv['id']}", help=_data, use_container_width=True):
+                            st.session_state.conversation_id = _conv["id"]
+                            st.session_state.messages = _load_conversation_messages(_conv["id"])
+                            st.rerun()
+                    with _col_b:
+                        if st.button(
+                            "📍" if _e_pinnata else "📌",
+                            key=f"pin_{_conv['id']}",
+                            help="Rimuovi dai preferiti" if _e_pinnata else "Fissa in cima come preferita",
+                        ):
+                            _toggle_pin_conversation(_conv["id"], not _e_pinnata)
+                            st.rerun()
+                    with _col_c:
+                        _conferma_key = f"conferma_del_conv_{_conv['id']}"
+                        if st.session_state.get(_conferma_key):
+                            if st.button("✅", key=f"del_yes_{_conv['id']}", help="Conferma eliminazione"):
+                                _delete_conversation(_conv["id"])
+                                st.session_state.pop(_conferma_key, None)
+                                if _conv["id"] == _conv_attiva:
+                                    st.session_state.conversation_id = _create_conversation(_nome_utente_corrente)
+                                    st.session_state.messages = []
+                                st.rerun()
+                        else:
+                            if st.button("🗑️", key=f"del_{_conv['id']}", help="Elimina questa conversazione"):
+                                st.session_state[_conferma_key] = True
+                                st.rerun()
 
     st.markdown("---")
     st.markdown("#### Risposte vocali")
     if "tts_enabled" not in st.session_state:
         st.session_state.tts_enabled = True
     st.session_state.tts_enabled = st.toggle(
-        "Leggi le risposte ad alta voce",
+        "Rispondi a voce quando faccio una domanda a voce",
         value=st.session_state.tts_enabled,
-        help="Se disattivato, le risposte vengono mostrate solo come testo, senza sintesi vocale.",
+        help=(
+            "Se attivo, quando fai una domanda usando il microfono la risposta viene letta "
+            "automaticamente ad alta voce. Se scrivi la domanda, la risposta resta solo scritta: "
+            "puoi comunque farla leggere in qualsiasi momento con l'icona 🔊 sotto ogni risposta."
+        ),
     )
 
     if IS_PARENT:
@@ -1185,6 +1531,12 @@ else:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message["role"] == "assistant":
+                _b64_msg = base64.b64encode(message["content"].encode("utf-8")).decode("ascii")
+                st.markdown(
+                    f'<button class="carpanet-tts-btn" data-b64="{_b64_msg}" title="Leggi ad alta voce / pausa">🔊</button>',
+                    unsafe_allow_html=True,
+                )
 
     if not st.session_state.messages:
         st.caption(
@@ -1202,8 +1554,13 @@ else:
     )
 
     if user_input:
-        prompt = (user_input.text or "").strip()
-        notes = []
+        testo_scritto = (user_input.text or "").strip()
+        # Tiene traccia se QUESTO messaggio e arrivato tramite microfono: serve
+        # dopo per decidere se leggere la risposta ad alta voce in automatico
+        # (solo se la domanda e stata fatta a voce) oppure lasciarla solo scritta.
+        _input_era_vocale = user_input.audio is not None
+        trascrizione_audio = ""
+        _audio_non_trascritto = False
 
         if user_input.audio is not None:
             try:
@@ -1212,27 +1569,69 @@ else:
                     file=("audio.wav", user_input.audio.getvalue()),
                     language="it",
                 )
-                transcribed = (transcription.text or "").strip()
-                if transcribed:
-                    prompt = (prompt + " " + transcribed).strip() if prompt else transcribed
+                trascrizione_audio = (transcription.text or "").strip()
             except Exception:
-                notes.append("[Audio ricevuto ma non e stato possibile trascriverlo]")
+                _audio_non_trascritto = True
 
-        for f in (user_input.files or []):
-            file_bytes = f.getvalue()
-            r2_link = r2_upload(file_bytes, f.name, R2_BUCKET_ALLEGATI, R2_PUBLIC_URL_ALLEGATI)
-            if r2_link is not None:
-                notes.append(f"[Allegato salvato: {f.name} ({r2_link})]")
+        if testo_scritto and trascrizione_audio:
+            testo_completo = (testo_scritto + " " + trascrizione_audio).strip()
+        else:
+            testo_completo = testo_scritto or trascrizione_audio
+
+        _file_allegati = user_input.files or []
+        _resto_addestramento = _testo_comando_addestramento(testo_completo)
+        _comando_addestramento_attivo = _resto_addestramento is not None
+
+        if _comando_addestramento_attivo:
+            # Il comando "addestramento" salva testo/file nella memoria
+            # permanente invece di essere mandato all'AI come domanda normale:
+            # gli allegati vanno quindi nello spazio dedicato all'addestramento,
+            # non tra gli allegati occasionali della chat.
+            prompt = testo_completo if testo_completo else "addestramento"
+            if not IS_PARENT:
+                risposta_addestramento = "Solo un genitore puo' aggiungere materiale di addestramento, mi dispiace."
             else:
-                notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche lo spazio di archiviazione non e ancora configurato o non e raggiungibile]")
+                risposta_addestramento = _gestisci_addestramento(
+                    _resto_addestramento,
+                    _file_allegati,
+                    st.session_state.current_user.get("name", "Utente"),
+                )
+        else:
+            notes = []
+            if _audio_non_trascritto:
+                notes.append("[Audio ricevuto ma non e stato possibile trascriverlo]")
+            for f in _file_allegati:
+                file_bytes = f.getvalue()
+                r2_link = r2_upload(file_bytes, f.name, R2_BUCKET_ALLEGATI, R2_PUBLIC_URL_ALLEGATI)
+                if r2_link is not None:
+                    notes.append(f"[Allegato salvato: {f.name} ({r2_link})]")
+                else:
+                    notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche lo spazio di archiviazione non e ancora configurato o non e raggiungibile]")
 
-        if notes:
-            prompt = (prompt + "\n\n" + "\n".join(notes)).strip() if prompt else "\n".join(notes)
+            prompt = testo_completo
+            if notes:
+                prompt = (prompt + "\n\n" + "\n".join(notes)).strip() if prompt else "\n".join(notes)
 
     else:
         prompt = None
+        _input_era_vocale = False
+        _comando_addestramento_attivo = False
 
     if prompt:
+        # Un nuovo messaggio ha sempre la priorita': se l'assistente sta ancora
+        # leggendo ad alta voce la risposta precedente, la interrompe subito
+        # (la nuova risposta arrivera' scritta o a voce a seconda di come e
+        # arrivato QUESTO messaggio, deciso piu' sotto).
+        components.html("""
+        <script>
+        (function() {
+            var topWin = window.parent || window;
+            if (topWin.__carpanetStopSpeaking) { topWin.__carpanetStopSpeaking(); }
+            else if (topWin.speechSynthesis) { topWin.speechSynthesis.cancel(); }
+        })();
+        </script>
+        """, height=0)
+
         st.session_state.messages.append({"role": "user", "content": prompt})
         if MEMORIA_PERSISTENTE:
             _era_conversazione_vuota = len(st.session_state.messages) == 1
@@ -1247,58 +1646,73 @@ else:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            def is_too_large_error(exc):
-                msg = str(exc).lower()
-                return "413" in str(exc) or "too large" in msg or "request_too_large" in msg or "rate_limit" in msg
-
             response = None
-            try:
-                api_messages = build_api_messages(
-                    st.session_state.messages,
-                    st.session_state.get("knowledge_text", ""),
-                    location_text=st.session_state.get("user_location"),
-                )
-                completion = client.chat.completions.create(
-                    model=PRIMARY_MODEL,
-                    messages=api_messages,
-                    max_tokens=PRIMARY_MAX_TOKENS,
-                )
-                response = completion.choices[0].message.content
-            except Exception as e:
-                if is_too_large_error(e):
-                    try:
-                        fallback_messages = build_api_messages(
-                            st.session_state.messages,
-                            st.session_state.get("knowledge_text", ""),
-                            history_limit=3,
-                            char_limit=600,
-                            location_text=st.session_state.get("user_location"),
-                        )
-                        fallback_completion = client.chat.completions.create(
-                            model=FALLBACK_MODEL,
-                            messages=fallback_messages,
-                            max_tokens=FALLBACK_MAX_TOKENS,
-                        )
-                        response = fallback_completion.choices[0].message.content
-                    except Exception as e2:
-                        st.error("La richiesta era troppo grande anche per il modello di riserva. Prova a fare una domanda piu breve o dividila in piu messaggi.")
-                else:
-                    st.error(f"Errore generazione: {e}")
+
+            if _comando_addestramento_attivo:
+                # Comando di addestramento: nessuna chiamata all'AI, si usa
+                # direttamente la conferma (o il messaggio d'errore) gia'
+                # preparata sopra durante la gestione dell'allegato/testo.
+                response = risposta_addestramento
+            else:
+                def is_too_large_error(exc):
+                    msg = str(exc).lower()
+                    return "413" in str(exc) or "too large" in msg or "request_too_large" in msg or "rate_limit" in msg
+
+                try:
+                    api_messages = build_api_messages(
+                        st.session_state.messages,
+                        st.session_state.get("knowledge_text", ""),
+                        location_text=st.session_state.get("user_location"),
+                    )
+                    completion = client.chat.completions.create(
+                        model=PRIMARY_MODEL,
+                        messages=api_messages,
+                        max_tokens=PRIMARY_MAX_TOKENS,
+                    )
+                    response = completion.choices[0].message.content
+                except Exception as e:
+                    if is_too_large_error(e):
+                        try:
+                            fallback_messages = build_api_messages(
+                                st.session_state.messages,
+                                st.session_state.get("knowledge_text", ""),
+                                history_limit=3,
+                                char_limit=600,
+                                location_text=st.session_state.get("user_location"),
+                            )
+                            fallback_completion = client.chat.completions.create(
+                                model=FALLBACK_MODEL,
+                                messages=fallback_messages,
+                                max_tokens=FALLBACK_MAX_TOKENS,
+                            )
+                            response = fallback_completion.choices[0].message.content
+                        except Exception as e2:
+                            st.error("La richiesta era troppo grande anche per il modello di riserva. Prova a fare una domanda piu breve o dividila in piu messaggi.")
+                    else:
+                        st.error(f"Errore generazione: {e}")
 
             if response is not None:
                 st.markdown(response)
+                _b64_risposta = base64.b64encode(response.encode("utf-8")).decode("ascii")
+                st.markdown(
+                    f'<button class="carpanet-tts-btn" data-b64="{_b64_risposta}" title="Leggi ad alta voce / pausa">🔊</button>',
+                    unsafe_allow_html=True,
+                )
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 if MEMORIA_PERSISTENTE:
                     _append_message(st.session_state.conversation_id, "assistant", response)
                 else:
                     save_memory(st.session_state.messages)
 
-                if st.session_state.get("tts_enabled", True):
-                    tts_script = f"""
+                # Lettura automatica SOLO se la domanda e' arrivata a voce:
+                # se e' stata scritta, la risposta resta solo testo (si puo'
+                # comunque far leggere in ogni momento con il pulsante 🔊 qui sopra).
+                if _input_era_vocale and st.session_state.get("tts_enabled", True):
+                    components.html(f"""
                     <script>
-                        var msg = new SpeechSynthesisUtterance({repr(response)});
-                        msg.lang = 'it-IT';
-                        window.speechSynthesis.speak(msg);
+                    (function() {{
+                        var topWin = window.parent || window;
+                        if (topWin.__carpanetSpeak) {{ topWin.__carpanetSpeak({json.dumps(response)}); }}
+                    }})();
                     </script>
-                    """
-                    st.components.v1.html(tts_script, height=0)
+                    """, height=0)
