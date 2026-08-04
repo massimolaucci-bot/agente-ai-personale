@@ -980,52 +980,160 @@ components.html("""
 (function() {
     var topWin = window.parent || window;
     var doc = topWin.document;
-    if (!doc.body || doc.body.dataset.carpanetTtsBound) { return; }
-    doc.body.dataset.carpanetTtsBound = '1';
-
+    if (!doc.body) { return; }
     if (!('speechSynthesis' in topWin)) { return; }
+
+    // NOTA IMPORTANTE (causa reale del pulsante che "a volte" non risponde al
+    // click, trovata con test ripetuti - circa 1 volta su 3): un tentativo
+    // (attributo onclick scritto direttamente nell'HTML del pulsante) e'
+    // stato scartato perche' Streamlit rimuove sempre gli attributi
+    // "onclick" dal markdown per sicurezza (verificato). Un secondo
+    // tentativo (listener "delegato" legato UNA SOLA VOLTA su document,
+    // dentro l'iframe temporaneo creato da components.html) falliva
+    // in modo imprevedibile: il listener risultava registrato, ma a volte
+    // non veniva comunque invocato al click - probabilmente per un raro
+    // problema di isolamento tra il contesto dell'iframe (che viene
+    // ricreato ad ogni "rerun" di Streamlit) e il documento principale.
+    // SOLUZIONE: le funzioni condivise (sintetizzatore, lettura, ecc.)
+    // restano definite UNA SOLA VOLTA su "window" (persistono tra un giro e
+    // l'altro), ma il listener di click viene ora ricollegato ad OGNI
+    // giro - rimuovendo prima quello precedente - cosi' e' sempre legato
+    // a un contesto "fresco" invece di dipendere da un unico tentativo
+    // fatto al primissimo caricamento della pagina.
+    if (!topWin.__carpanetTtsReady) {
+    topWin.__carpanetTtsReady = true;
     var synth = topWin.speechSynthesis;
     var corrente = { bottone: null };
+    // "Riscalda" subito l'elenco delle voci disponibili: su diversi browser
+    // la primissima chiamata a getVoices() e' quella che avvia il
+    // caricamento (altrimenti resta vuoto finche' non viene richiamata una
+    // prima volta) - farlo gia' ora, alla preparazione della pagina, riduce
+    // le possibilita' che al momento del click le voci non siano ancora
+    // pronte.
+    try { synth.getVoices(); } catch (e) {}
 
+    // NOTA (altra causa reale trovata con test ripetuti): qui sotto si usano
+    // deliberatamente "topWin.atob", "topWin.Uint8Array" e
+    // "topWin.TextDecoder" - MAI le versioni "nude" (atob, Uint8Array,
+    // TextDecoder) senza prefisso. Motivo: queste funzioni vivono nel
+    // contesto JavaScript di QUESTO iframe temporaneo, che Streamlit puo'
+    // riciclare/sostituire per un altro componente dopo il primo utilizzo;
+    // quando succede, i costruttori nativi "nudi" catturati da questa
+    // funzione smettono di funzionare (errore "non e' un costruttore"),
+    // anche se la funzione stessa resta richiamabile da "window" della
+    // pagina principale. Usando sempre "topWin.XXX" si punta invece ai
+    // costruttori della pagina principale, che non viene mai ricreata.
     function decodificaB64Utf8(b64) {
-        var raw = atob(b64);
-        var bytes = new Uint8Array(raw.length);
+        var raw = topWin.atob(b64);
+        var bytes = new topWin.Uint8Array(raw.length);
         for (var i = 0; i < raw.length; i++) { bytes[i] = raw.charCodeAt(i); }
-        return new TextDecoder('utf-8').decode(bytes);
+        return new topWin.TextDecoder('utf-8').decode(bytes);
     }
 
-    // NOTA (dopo due tentativi che hanno peggiorato le cose): qui si torna
-    // deliberatamente alla versione piu' semplice possibile - cancel() e
-    // speak() chiamati subito, uno dopo l'altro, nello stesso click, senza
-    // ritardi artificiali ne' "sblocchi" preventivi. I tentativi precedenti
-    // (un piccolo ritardo tra cancel() e speak(), e un'utterance di sblocco
-    // al primo tocco) erano pensati per aggirare un bug di Chrome desktop, ma
-    // hanno introdotto un problema peggiore: il ritardo puo' far perdere ad
+    // Cerca una voce italiana tra quelle installate nel browser/sistema. Se
+    // non ce n'e' nessuna, e' meglio NON forzare lang='it-IT' sull'utterance:
+    // su diversi browser (soprattutto desktop senza pacchetto voce italiano
+    // installato dal sistema operativo) questo causa un errore silenzioso
+    // "language-unavailable" invece di leggere comunque con la voce di
+    // default del browser.
+    function trovaVoceItaliana() {
+        var voci;
+        try { voci = synth.getVoices() || []; } catch (e) { return null; }
+        if (!voci.length) { return null; }
+        var i;
+        for (i = 0; i < voci.length; i++) {
+            if (voci[i].lang && voci[i].lang.toLowerCase() === 'it-it') { return voci[i]; }
+        }
+        for (i = 0; i < voci.length; i++) {
+            if (voci[i].lang && voci[i].lang.toLowerCase().indexOf('it') === 0) { return voci[i]; }
+        }
+        return null;
+    }
+
+    function ripristina(bottone) {
+        if (corrente.bottone === bottone) {
+            bottone.textContent = '🔊';
+            corrente.bottone = null;
+        }
+    }
+
+    // Mostra il motivo REALE dell'errore accanto al pulsante. Finora, quando
+    // la lettura falliva, l'unico sintomo visibile era "non succede niente"
+    // - impossibile da diagnosticare a distanza. Cosi', se fallisce ancora,
+    // il motivo esatto (es. "language-unavailable", "not-allowed",
+    // "audio-hardware"...) compare in pagina e puo' essere riferito in chat.
+    function mostraErrore(bottone, motivo) {
+        var contenitore = bottone.parentElement;
+        if (!contenitore) { return; }
+        var esistente = contenitore.querySelector('.carpanet-tts-errore');
+        if (esistente) { esistente.remove(); }
+        var elErrore = doc.createElement('span');
+        elErrore.className = 'carpanet-tts-errore';
+        elErrore.style.cssText = 'display:block;font-size:0.75rem;color:#ff8a8a;margin-top:2px;';
+        elErrore.textContent = 'Lettura non riuscita (motivo: ' + motivo + ')';
+        contenitore.appendChild(elErrore);
+    }
+
+    // NOTA (dopo due tentativi che hanno peggiorato le cose): la chiamata a
+    // cancel()+speak() resta sincrona nello stesso click, senza ritardi
+    // artificiali ne' "sblocchi" preventivi - un ritardo puo' far perdere ad
     // alcuni browser (soprattutto mobile) il collegamento tra il tocco
-    // dell'utente e l'audio, che molti browser richiedono avvenga nello
-    // stesso istante del tocco - risultato: audio muto. Restare sincroni con
-    // il click e' anche il comportamento originale che funzionava al primo
-    // utilizzo.
+    // dell'utente e l'audio. L'unica eccezione e' l'attesa (breve, max
+    // 300ms) delle voci di sintesi quando non sono ancora pronte: capita
+    // solo al primissimo utilizzo su alcuni browser, ed e' comunque avviata
+    // dentro la stessa catena del click, non con un ritardo indipendente.
     function leggi(bottone) {
         var testo = decodificaB64Utf8(bottone.getAttribute('data-b64'));
-        var utterance = new topWin.SpeechSynthesisUtterance(testo);
-        utterance.lang = 'it-IT';
-        utterance.onend = function() {
-            if (corrente.bottone === bottone) { bottone.textContent = '🔊'; corrente.bottone = null; }
-        };
-        utterance.onerror = function() {
-            if (corrente.bottone === bottone) { bottone.textContent = '🔊'; corrente.bottone = null; }
-        };
-        synth.cancel();
-        corrente.bottone = bottone;
-        bottone.textContent = '⏸️';
-        synth.speak(utterance);
+
+        function avvia() {
+            var utterance = new topWin.SpeechSynthesisUtterance(testo);
+            var voce = trovaVoceItaliana();
+            if (voce) {
+                utterance.voice = voce;
+                utterance.lang = voce.lang;
+            } else {
+                utterance.lang = 'it-IT';
+            }
+            utterance.onend = function() { ripristina(bottone); };
+            utterance.onerror = function(ev) {
+                ripristina(bottone);
+                var motivo = (ev && ev.error) ? ev.error : 'sconosciuto';
+                if (motivo !== 'canceled' && motivo !== 'interrupted') {
+                    mostraErrore(bottone, motivo);
+                }
+            };
+            synth.cancel();
+            corrente.bottone = bottone;
+            bottone.textContent = '⏸️';
+            synth.speak(utterance);
+        }
+
+        var voci_pronte = [];
+        try { voci_pronte = synth.getVoices() || []; } catch (e) {}
+        if (voci_pronte.length > 0) {
+            avvia();
+        } else {
+            var gia_avviato = false;
+            var timeoutId = topWin.setTimeout(function() {
+                if (!gia_avviato) { gia_avviato = true; avvia(); }
+            }, 300);
+            synth.onvoiceschanged = function() {
+                if (!gia_avviato) {
+                    gia_avviato = true;
+                    topWin.clearTimeout(timeoutId);
+                    avvia();
+                }
+            };
+        }
     }
 
-    doc.addEventListener('click', function(ev) {
-        var bottone = ev.target && ev.target.closest ? ev.target.closest('.carpanet-tts-btn') : null;
-        if (!bottone) { return; }
-        ev.preventDefault();
+    // Richiamata dal listener di click delegato (vedi piu' sotto, fuori da
+    // questo blocco "una tantum": e' lui che riceve i click reali e trova il
+    // pulsante corretto con closest()).
+    topWin.__carpanetToggleTts = function(bottone) {
+        var contenitore = bottone.parentElement;
+        var erroreEsistente = contenitore ? contenitore.querySelector('.carpanet-tts-errore') : null;
+        if (erroreEsistente) { erroreEsistente.remove(); }
 
         if (corrente.bottone === bottone && (synth.speaking || synth.paused)) {
             // Stesso pulsante, lettura in corso o in pausa: alterna pausa / riprendi.
@@ -1046,7 +1154,7 @@ components.html("""
             corrente.bottone.textContent = '🔊';
         }
         leggi(bottone);
-    });
+    };
 
     // Lettura automatica (dopo una domanda fatta a voce): interrompe quella in
     // corso, se c'e', e legge la nuova risposta.
@@ -1054,7 +1162,13 @@ components.html("""
         if (corrente.bottone) { corrente.bottone.textContent = '🔊'; corrente.bottone = null; }
         synth.cancel();
         var utterance = new topWin.SpeechSynthesisUtterance(testo);
-        utterance.lang = 'it-IT';
+        var voce = trovaVoceItaliana();
+        if (voce) {
+            utterance.voice = voce;
+            utterance.lang = voce.lang;
+        } else {
+            utterance.lang = 'it-IT';
+        }
         synth.speak(utterance);
     };
     // Interrompe qualunque lettura in corso senza avviarne una nuova: usato
@@ -1064,6 +1178,20 @@ components.html("""
         synth.cancel();
         if (corrente.bottone) { corrente.bottone.textContent = '🔊'; corrente.bottone = null; }
     };
+    } // fine "if (!topWin.__carpanetTtsReady)"
+
+    // Da qui in poi si esegue ad OGNI giro (vedi nota sopra): ricollega il
+    // listener di click, rimuovendo prima quello del giro precedente.
+    if (topWin.__carpanetClickHandler) {
+        doc.removeEventListener('click', topWin.__carpanetClickHandler);
+    }
+    topWin.__carpanetClickHandler = function(ev) {
+        var bottone = ev.target && ev.target.closest ? ev.target.closest('.carpanet-tts-btn') : null;
+        if (!bottone) { return; }
+        ev.preventDefault();
+        if (topWin.__carpanetToggleTts) { topWin.__carpanetToggleTts(bottone); }
+    };
+    doc.addEventListener('click', topWin.__carpanetClickHandler);
 })();
 </script>
 """, height=0)
@@ -1706,15 +1834,24 @@ else:
     # non c'e piu nessun elemento "estraneo" iniettato dentro la barra di input
     # che possa entrare in conflitto con i controlli nativi del browser.
 
-    for message in st.session_state.messages:
+    # Il pulsante 🔊 viene mostrato solo sull'ULTIMO messaggio dell'assistente
+    # (non su ogni risposta passata): su richiesta esplicita dell'utente, per
+    # ridurre la confusione di avere piu' pulsanti di lettura contemporanei
+    # nella stessa schermata.
+    # Nota tecnica: qui sotto NON sappiamo ancora se in questo stesso giro di
+    # esecuzione arrivera' anche una risposta nuova (lo sapremo solo piu'
+    # sotto, dopo aver letto il campo di chat) - percio' per l'ultimo
+    # messaggio si usa un segnaposto vuoto (st.empty), riempito subito dopo
+    # con il pulsante SOLO se non sta per arrivare una risposta piu' recente
+    # nello stesso giro (altrimenti il pulsante verrebbe mostrato due volte:
+    # qui e sulla risposta nuova appena generata).
+    _indice_ultimo_messaggio = len(st.session_state.messages) - 1
+    _segnaposto_pulsante_ultimo = None
+    for _indice_messaggio, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            if message["role"] == "assistant":
-                _b64_msg = base64.b64encode(message["content"].encode("utf-8")).decode("ascii")
-                st.markdown(
-                    f'<button class="carpanet-tts-btn" data-b64="{_b64_msg}" title="Leggi ad alta voce / pausa">🔊</button>',
-                    unsafe_allow_html=True,
-                )
+            if message["role"] == "assistant" and _indice_messaggio == _indice_ultimo_messaggio:
+                _segnaposto_pulsante_ultimo = st.empty()
 
     if not st.session_state.messages:
         st.caption(
@@ -1792,6 +1929,17 @@ else:
         prompt = None
         _input_era_vocale = False
         _comando_addestramento_attivo = False
+
+    # Ora che sappiamo se in questo giro arriva anche una risposta nuova,
+    # possiamo riempire (o lasciare vuoto) il segnaposto del pulsante 🔊
+    # sull'ultimo messaggio gia' esistente - vedi nota sopra nel ciclo che
+    # mostra la cronologia.
+    if _segnaposto_pulsante_ultimo is not None and not prompt and st.session_state.messages:
+        _b64_msg_ultimo = base64.b64encode(st.session_state.messages[-1]["content"].encode("utf-8")).decode("ascii")
+        _segnaposto_pulsante_ultimo.markdown(
+            f'<button class="carpanet-tts-btn" data-b64="{_b64_msg_ultimo}" title="Leggi ad alta voce / pausa">🔊</button>',
+            unsafe_allow_html=True,
+        )
 
     if prompt:
         # Un nuovo messaggio ha sempre la priorita': se l'assistente sta ancora
