@@ -994,17 +994,20 @@ components.html("""
         return new TextDecoder('utf-8').decode(bytes);
     }
 
-    // Chrome (desktop e Android) ha un bug noto e molto diffuso: se si chiama
-    // speak() troppo a ridosso di un cancel() (nello stesso istante), oppure
-    // se il motore di sintesi vocale e' rimasto "fermo" per qualche secondo
-    // dopo l'ultima lettura, le chiamate successive a speak() possono fallire
-    // in silenzio (nessun audio, nessun evento onstart/onend: il pulsante
-    // resta come "bloccato"). Questo e' esattamente il comportamento
-    // descritto: la prima lettura funziona, quelle dopo no. Il rimedio
-    // raccomandato e' annullare sempre prima, aspettare un istante brevissimo
-    // e SOLO DOPO avviare la nuova lettura (mai speak() subito dopo cancel()
-    // nello stesso istante).
-    function avvia(bottone, testo) {
+    // NOTA (dopo due tentativi che hanno peggiorato le cose): qui si torna
+    // deliberatamente alla versione piu' semplice possibile - cancel() e
+    // speak() chiamati subito, uno dopo l'altro, nello stesso click, senza
+    // ritardi artificiali ne' "sblocchi" preventivi. I tentativi precedenti
+    // (un piccolo ritardo tra cancel() e speak(), e un'utterance di sblocco
+    // al primo tocco) erano pensati per aggirare un bug di Chrome desktop, ma
+    // hanno introdotto un problema peggiore: il ritardo puo' far perdere ad
+    // alcuni browser (soprattutto mobile) il collegamento tra il tocco
+    // dell'utente e l'audio, che molti browser richiedono avvenga nello
+    // stesso istante del tocco - risultato: audio muto. Restare sincroni con
+    // il click e' anche il comportamento originale che funzionava al primo
+    // utilizzo.
+    function leggi(bottone) {
+        var testo = decodificaB64Utf8(bottone.getAttribute('data-b64'));
         var utterance = new topWin.SpeechSynthesisUtterance(testo);
         utterance.lang = 'it-IT';
         utterance.onend = function() {
@@ -1013,16 +1016,10 @@ components.html("""
         utterance.onerror = function() {
             if (corrente.bottone === bottone) { bottone.textContent = '🔊'; corrente.bottone = null; }
         };
+        synth.cancel();
         corrente.bottone = bottone;
-        corrente.utterance = utterance;
         bottone.textContent = '⏸️';
         synth.speak(utterance);
-    }
-
-    function leggi(bottone) {
-        var testo = decodificaB64Utf8(bottone.getAttribute('data-b64'));
-        synth.cancel();
-        setTimeout(function() { avvia(bottone, testo); }, 80);
     }
 
     doc.addEventListener('click', function(ev) {
@@ -1044,49 +1041,21 @@ components.html("""
 
         // Pulsante nuovo, oppure stesso pulsante ma la lettura precedente e'
         // gia' terminata (si riparte da capo): ferma tutto e avvia quella
-        // nuova, sempre passando dal cancel() + piccola attesa di leggi().
+        // nuova.
         if (corrente.bottone && corrente.bottone !== bottone) {
             corrente.bottone.textContent = '🔊';
         }
         leggi(bottone);
     });
 
-    // "Sblocco" del motore vocale al primissimo tocco/click sulla pagina:
-    // su alcuni browser (soprattutto mobile) la sintesi vocale resta
-    // silenziosa finche' non viene "attivata" da un gesto dell'utente.
-    // IMPORTANTE: un'utterance con testo VUOTO ('') puo' restare bloccata per
-    // sempre nella coda su alcuni browser (Chrome in particolare), perche' non
-    // arriva mai a generare l'evento di fine lettura: il risultato e' che
-    // TUTTE le letture successive restano mute, anche quella dal pulsante
-    // 🔊 (bug scoperto dopo il rilascio). Per questo qui usiamo un testo non
-    // vuoto ma silenzioso (volume 0) e velocissimo, e in piu' lo cancelliamo
-    // comunque poco dopo come rete di sicurezza, cosi' non puo' mai bloccare
-    // le letture vere.
-    var sbloccato = false;
-    function sbloccaMotoreVocale() {
-        if (sbloccato) { return; }
-        sbloccato = true;
-        try {
-            var muto = new topWin.SpeechSynthesisUtterance('.');
-            muto.volume = 0;
-            muto.rate = 10;
-            synth.speak(muto);
-            setTimeout(function() { synth.cancel(); }, 300);
-        } catch (e) { /* ignorato: non e' critico */ }
-    }
-    doc.addEventListener('click', sbloccaMotoreVocale, { once: true, capture: true });
-    doc.addEventListener('touchstart', sbloccaMotoreVocale, { once: true, capture: true });
-
     // Lettura automatica (dopo una domanda fatta a voce): interrompe quella in
     // corso, se c'e', e legge la nuova risposta.
     topWin.__carpanetSpeak = function(testo) {
         if (corrente.bottone) { corrente.bottone.textContent = '🔊'; corrente.bottone = null; }
         synth.cancel();
-        setTimeout(function() {
-            var utterance = new topWin.SpeechSynthesisUtterance(testo);
-            utterance.lang = 'it-IT';
-            synth.speak(utterance);
-        }, 80);
+        var utterance = new topWin.SpeechSynthesisUtterance(testo);
+        utterance.lang = 'it-IT';
+        synth.speak(utterance);
     };
     // Interrompe qualunque lettura in corso senza avviarne una nuova: usato
     // quando arriva un nuovo messaggio (scritto o vocale) mentre l'assistente
