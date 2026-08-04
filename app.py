@@ -1053,17 +1053,25 @@ components.html("""
 
     // "Sblocco" del motore vocale al primissimo tocco/click sulla pagina:
     // su alcuni browser (soprattutto mobile) la sintesi vocale resta
-    // silenziosa finche' non viene "attivata" da un gesto dell'utente. Con
-    // un'utterance vuota, innocua e silenziosa, ci assicuriamo che il motore
-    // sia gia' pronto quando l'utente preme per la prima volta il pulsante
-    // di lettura o fa una domanda a voce.
+    // silenziosa finche' non viene "attivata" da un gesto dell'utente.
+    // IMPORTANTE: un'utterance con testo VUOTO ('') puo' restare bloccata per
+    // sempre nella coda su alcuni browser (Chrome in particolare), perche' non
+    // arriva mai a generare l'evento di fine lettura: il risultato e' che
+    // TUTTE le letture successive restano mute, anche quella dal pulsante
+    // 🔊 (bug scoperto dopo il rilascio). Per questo qui usiamo un testo non
+    // vuoto ma silenzioso (volume 0) e velocissimo, e in piu' lo cancelliamo
+    // comunque poco dopo come rete di sicurezza, cosi' non puo' mai bloccare
+    // le letture vere.
     var sbloccato = false;
     function sbloccaMotoreVocale() {
         if (sbloccato) { return; }
         sbloccato = true;
         try {
-            var muto = new topWin.SpeechSynthesisUtterance('');
+            var muto = new topWin.SpeechSynthesisUtterance('.');
+            muto.volume = 0;
+            muto.rate = 10;
             synth.speak(muto);
+            setTimeout(function() { synth.cancel(); }, 300);
         } catch (e) { /* ignorato: non e' critico */ }
     }
     doc.addEventListener('click', sbloccaMotoreVocale, { once: true, capture: true });
