@@ -1242,7 +1242,9 @@ def _render_google_connection_ui():
     _utente_corrente = st.session_state.current_user
 
     if IS_PARENT:
-        st.caption("Account condiviso di famiglia (usato quando non e' collegato un account personale).")
+        st.caption("Account condiviso di famiglia: puoi collegarlo insieme al tuo account personale qui sotto. "
+                   "Viene usato per le richieste che riguardano la famiglia (es. \"che impegni c'e' nel calendario di famiglia?\"), "
+                   "oppure come riserva se non hai collegato un account personale.")
         _shared = _fetch_google_tokens("shared")
         if _shared:
             st.success("Account condiviso collegato.")
@@ -1254,7 +1256,8 @@ def _render_google_connection_ui():
         st.caption("L'accesso a Gmail va ricollegato circa ogni 7 giorni (limite dell'app Google in modalita' di test): basta ricliccare il collegamento quando serve.")
         st.markdown("---")
 
-    st.caption(f"Il tuo account Google personale ({_utente_corrente.get('name', 'Utente')}).")
+    st.caption(f"Il tuo account Google personale ({_utente_corrente.get('name', 'Utente')}): usato di default per le tue richieste "
+               "(es. \"che email ho?\", \"che impegni ho oggi?\"). Puoi averlo collegato insieme a quello di famiglia qui sopra.")
     _personal = _fetch_google_tokens("personal", _utente_corrente.get("id"))
     if _personal:
         st.success("Il tuo account personale e' collegato.")
@@ -1281,13 +1284,35 @@ def _testo_comando_google(testo):
     return None
 
 
-def _scegli_connessione_google(utente):
-    # Preferisce l'account personale dell'utente, se collegato; altrimenti,
-    # solo per i genitori, ricade sull'account condiviso di famiglia.
+def _richiesta_riguarda_famiglia(testo):
+    # Rilevamento a parole chiave (stesso limite del rilevamento comandi):
+    # permette di dire esplicitamente "guarda il calendario di famiglia"
+    # per usare l'account condiviso anche quando e' collegato anche un
+    # account personale.
+    t = (testo or "").lower()
+    return any(k in t for k in [
+        "di famiglia", "della famiglia", "familiare", "familiari",
+        "condiviso", "condivisa", "comune", "di tutti", "per tutti", "nostro", "nostra",
+    ])
+
+
+def _scegli_connessione_google(utente, testo_completo=""):
+    # Entrambi gli account (condiviso di famiglia e personale) possono
+    # essere collegati insieme: quale usare per un dato comando dipende
+    # da cosa viene chiesto, non solo da cosa e' disponibile.
+    # - Se la richiesta menziona esplicitamente la famiglia/il condiviso
+    #   (e l'account condiviso e' collegato) -> usa quello condiviso.
+    # - Altrimenti, se l'utente ha un account personale collegato -> usalo
+    #   (le attivita' personali di ognuno restano sul proprio account).
+    # - Altrimenti, solo per i genitori, ricade sull'account condiviso di
+    #   famiglia come riserva (es. genitore senza account personale collegato).
     _uid = utente.get("id")
+    _shared_collegato = _fetch_google_tokens("shared")
+    if _richiesta_riguarda_famiglia(testo_completo) and _shared_collegato:
+        return ("shared", None)
     if _fetch_google_tokens("personal", _uid):
         return ("personal", _uid)
-    if utente.get("role") == "genitore" and _fetch_google_tokens("shared"):
+    if utente.get("role") == "genitore" and _shared_collegato:
         return ("shared", None)
     return (None, None)
 
@@ -1296,7 +1321,7 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
     if not _google_oauth_enabled():
         return "La connessione con Google non e' ancora configurata su questo server."
 
-    conn_type, conn_user_id = _scegli_connessione_google(utente)
+    conn_type, conn_user_id = _scegli_connessione_google(utente, testo_completo)
     if not conn_type:
         return (
             "Non risulta ancora nessun account Google collegato (ne' il tuo personale ne' quello di famiglia). "
@@ -1306,27 +1331,35 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
     if not creds:
         return "Non riesco ad accedere al tuo account Google in questo momento: prova a ricollegarlo dalla barra laterale."
 
+    # Se l'utente ha entrambi gli account collegati, chiarisce sempre quale
+    # dei due ha risposto (evita ambiguita' su quale calendario/posta si sta
+    # leggendo, dato che ora possono essere collegati entrambi insieme).
+    _entrambi_collegati = bool(_fetch_google_tokens("personal", utente.get("id"))) and bool(_fetch_google_tokens("shared"))
+    _nota_fonte = ""
+    if _entrambi_collegati:
+        _nota_fonte = "\n\n_(account di famiglia)_" if conn_type == "shared" else "\n\n_(il tuo account personale — per la famiglia, chiedi es. \"calendario di famiglia\")_"
+
     if comando == "calendario":
         eventi = _list_calendar_events(creds, max_results=10)
         if eventi is None:
             return "Non sono riuscito a leggere il calendario in questo momento."
         if not eventi:
-            return "Non ci sono impegni in programma nel calendario."
+            return "Non ci sono impegni in programma nel calendario." + _nota_fonte
         righe = []
         for ev in eventi:
             _inizio = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date") or "?"
             _titolo = ev.get("summary", "(senza titolo)")
             righe.append(f"- {_inizio}: {_titolo}")
-        return "Ecco i prossimi impegni nel calendario:\n" + "\n".join(righe)
+        return "Ecco i prossimi impegni nel calendario:\n" + "\n".join(righe) + _nota_fonte
 
     if comando == "leggi_posta":
         emails = _list_recent_emails(creds, limit=5)
         if emails is None:
             return "Non sono riuscito a leggere la posta in questo momento."
         if not emails:
-            return "Non ci sono email recenti nella posta in arrivo."
+            return "Non ci sono email recenti nella posta in arrivo." + _nota_fonte
         righe = [f"- Da {em['from']} — {em['subject']}: {em['snippet']}" for em in emails]
-        return "Ecco le email piu' recenti:\n" + "\n".join(righe)
+        return "Ecco le email piu' recenti:\n" + "\n".join(righe) + _nota_fonte
 
     if comando == "bozza_risposta":
         emails = _list_recent_emails(creds, limit=1)
