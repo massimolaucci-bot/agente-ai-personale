@@ -199,7 +199,23 @@ def _google_flow():
             "redirect_uris": [GOOGLE_REDIRECT_URI],
         }
     }
-    return Flow.from_client_config(client_config, scopes=GOOGLE_OAUTH_SCOPES, redirect_uri=GOOGLE_REDIRECT_URI)
+    # PKCE disattivato di proposito: la libreria lo genererebbe di default,
+    # ma il "code_verifier" vivrebbe solo sull'istanza Flow che lo crea (qui
+    # dentro oauth_start) e andrebbe perso, perche' oauth_callback e' una
+    # richiesta HTTP separata che crea una Flow NUOVA (nessuno session_state
+    # condiviso tra le due route, per lo stesso motivo per cui usiamo lo
+    # "state" firmato). Il sintomo reale osservato in produzione era
+    # "(invalid_grant) Missing code verifier" al momento dello scambio del
+    # codice: la richiesta di autorizzazione includeva un code_challenge (PKCE
+    # auto-generato) ma quello di verifica non arrivava mai al token exchange.
+    # Questo client e' comunque "confidential" (usa GOOGLE_CLIENT_SECRET per
+    # autenticarsi), quindi PKCE non e' necessario per la sicurezza qui.
+    return Flow.from_client_config(
+        client_config,
+        scopes=GOOGLE_OAUTH_SCOPES,
+        redirect_uri=GOOGLE_REDIRECT_URI,
+        autogenerate_code_verifier=False,
+    )
 
 
 async def oauth_start(request):
