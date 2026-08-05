@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import hashlib
@@ -1220,7 +1221,11 @@ def _create_email_draft(creds, to_addr, subject, body_text):
         message["subject"] = subject
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         return service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
-    except Exception:
+    except Exception as e:
+        # Log diagnostico (visibile nei log di Render): senza questo, un
+        # errore qui era invisibile sia a noi sia all'utente, che vedeva solo
+        # un generico "non riuscito" senza nessun indizio sul motivo reale.
+        print(f"[google] _create_email_draft fallita: {e}", flush=True)
         return None
 
 
@@ -1228,7 +1233,8 @@ def _send_email_draft(creds, draft_id):
     try:
         service = google_build("gmail", "v1", credentials=creds)
         return service.users().drafts().send(userId="me", body={"id": draft_id}).execute()
-    except Exception:
+    except Exception as e:
+        print(f"[google] _send_email_draft fallita (draft_id={draft_id}): {e}", flush=True)
         return None
 
 
@@ -1277,6 +1283,15 @@ def _testo_comando_google(testo):
     t = (testo or "").lower()
     if any(k in t for k in ["rispondi a", "rispondi all'ultima", "prepara una bozza", "scrivi una bozza", "fammi una bozza", "scrivi una risposta"]):
         return "bozza_risposta"
+    # Comando distinto da "rispondi a" sopra: qui l'utente vuole scrivere
+    # un'email NUOVA a qualcuno (non una risposta a un'email ricevuta). Prima
+    # di questo fix non esisteva affatto: una richiesta del genere cadeva nel
+    # normale flusso di chat con Groq, che rispondeva a parole di non poter
+    # inviare email (bug segnalato dall'utente).
+    _verbo_di_invio = any(k in t for k in ["manda", "invia", "spedisci", "componi", "scriv"])
+    _parla_di_nuova_email = any(k in t for k in ["email", "e-mail", "mail", "posta"])
+    if _verbo_di_invio and _parla_di_nuova_email:
+        return "nuova_email"
     if any(k in t for k in ["leggimi la posta", "leggi la posta", "leggimi le mail", "leggimi le email", "ultime email", "ultime mail", "posta in arrivo", "che email ho"]):
         return "leggi_posta"
     # Riconoscimento piu' ampio: qualunque frase che nomini la posta/email E
@@ -1293,6 +1308,60 @@ def _testo_comando_google(testo):
     if any(k in t for k in ["calendario", "impegni", "agenda", "appuntamenti"]):
         return "calendario"
     return None
+
+
+_RE_INDIRIZZO_EMAIL = re.compile(r"[\w.\+\-]+@[\w\-]+\.[a-zA-Z]{2,}")
+
+
+def _estrai_indirizzo_email(testo):
+    # Non abbiamo una rubrica (nessun indirizzo Google e' salvato per gli
+    # account di famiglia): per scrivere un'email nuova serve che l'utente
+    # indichi l'indirizzo esplicitamente nella frase, riconosciuto qui con
+    # una semplice espressione regolare.
+    m = _RE_INDIRIZZO_EMAIL.search(testo or "")
+    return m.group(0) if m else None
+
+
+def _genera_nuova_email(testo_completo):
+    # Usa Groq per trasformare le indicazioni dell'utente in un oggetto +
+    # corpo dell'email, nello stesso spirito di come "bozza_risposta" genera
+    # il testo di una risposta (round 12), ma qui per un'email nuova senza
+    # nessuna email precedente a cui agganciarsi.
+    try:
+        _prompt = (
+            "L'utente vuole scrivere una NUOVA email (non e' una risposta a nessuna email ricevuta). "
+            "Sulla base di queste indicazioni scrivi un oggetto breve e il testo di un'email educata in italiano.\n\n"
+            f"Indicazioni dell'utente: {testo_completo}\n\n"
+            "Rispondi SOLO in questo formato esatto, su due righe, senza altro testo:\n"
+            "OGGETTO: <oggetto breve>\n"
+            "CORPO: <testo del messaggio>"
+        )
+        _groq_api_key_locale = os.environ.get("GROQ_API_KEY")
+        _client_bozza = Groq(api_key=_groq_api_key_locale)
+        _completamento = _client_bozza.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=[{"role": "user", "content": _prompt}],
+            max_tokens=400,
+        )
+        _testo = _completamento.choices[0].message.content or ""
+    except Exception as e:
+        print(f"[google] _genera_nuova_email fallita: {e}", flush=True)
+        return None, None
+
+    _oggetto, _corpo = None, None
+    for _riga in _testo.splitlines():
+        _riga = _riga.strip()
+        if _riga.upper().startswith("OGGETTO:"):
+            _oggetto = _riga.split(":", 1)[1].strip()
+        elif _riga.upper().startswith("CORPO:"):
+            _corpo = _riga.split(":", 1)[1].strip()
+    if not _corpo:
+        # Se il modello non ha seguito il formato richiesto, usa comunque
+        # tutto il testo generato come corpo piuttosto che fallire del tutto.
+        _corpo = _testo.strip()
+    if not _oggetto:
+        _oggetto = "(senza oggetto)"
+    return _oggetto, _corpo
 
 
 def _richiesta_riguarda_famiglia(testo):
@@ -1371,6 +1440,34 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
             return "Non ci sono email recenti nella posta in arrivo." + _nota_fonte
         righe = [f"- Da {em['from']} — {em['subject']}: {em['snippet']}" for em in emails]
         return "Ecco le email piu' recenti:\n" + "\n".join(righe) + _nota_fonte
+
+    if comando == "nuova_email":
+        _destinatario = _estrai_indirizzo_email(testo_completo)
+        if not _destinatario:
+            return (
+                "Posso preparare una nuova email, ma non ho una rubrica: dimmi anche l'indirizzo email "
+                "del destinatario nella stessa frase (es. \"manda una email a mario@esempio.com dicendo che...\")."
+            )
+        _oggetto_nuova, _corpo_nuovo = _genera_nuova_email(testo_completo)
+        if not _corpo_nuovo:
+            return "Non sono riuscito a generare il testo dell'email in questo momento."
+        draft = _create_email_draft(creds, _destinatario, _oggetto_nuova, _corpo_nuovo)
+        if not draft:
+            return "Ho preparato il testo ma non sono riuscito a salvarlo come bozza su Gmail."
+        st.session_state.setdefault("pending_google_drafts", {})
+        st.session_state["pending_google_drafts"][draft["id"]] = {
+            "conn_type": conn_type,
+            "conn_user_id": conn_user_id,
+            "to": _destinatario,
+            "subject": _oggetto_nuova,
+            "body": _corpo_nuovo,
+        }
+        return (
+            f"Ho preparato una bozza di email nuova per {_destinatario} (oggetto: \"{_oggetto_nuova}\"):\n\n"
+            f"{_corpo_nuovo}\n\n"
+            "Non l'ho inviata: la trovi anche tra le bozze di Gmail, oppure usa il pulsante di conferma "
+            "qui sopra nella chat per inviarla subito o scartarla."
+        )
 
     if comando == "bozza_risposta":
         emails = _list_recent_emails(creds, limit=1)
