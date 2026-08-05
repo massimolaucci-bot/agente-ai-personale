@@ -2,13 +2,21 @@ import os
 import json
 import base64
 import hashlib
+import hmac
 import secrets
+import time
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from email.mime.text import MIMEText
+from cryptography.fernet import Fernet
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from googleapiclient.discovery import build as google_build
+from googleapiclient.errors import HttpError as GoogleHttpError
 
 MEMORY_FILE = "chat_memory.json"
 KNOWLEDGE_FILE = "knowledge.json"
@@ -40,6 +48,41 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 def _supabase_enabled():
     return SUPABASE_HEADERS is not None
+
+
+# --- Google Calendar + Gmail (OAuth2, token cifrati su Supabase) ------------
+# Indirizzo pubblico dell'app: serve per costruire i link di collegamento a
+# Google (redirect_uri gia' registrato su Google Cloud Console) e i link di
+# ritorno mostrati nella pagina di conferma dopo il collegamento.
+APP_BASE_URL = (os.environ.get("APP_BASE_URL") or "https://agente-ai-vocale.onrender.com").rstrip("/")
+
+OAUTH_STATE_SECRET = os.environ.get("OAUTH_STATE_SECRET")
+TOKEN_ENCRYPTION_KEY = os.environ.get("TOKEN_ENCRYPTION_KEY")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GOOGLE_OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
+]
+
+# access_token/refresh_token sono piu' sensibili dei PIN/token "ricordami"
+# (quelli sono salvati solo come hash): qui serve la forma cifrata ma
+# reversibile, perche' il refresh_token deve poter essere riusato per
+# ottenere nuovi access_token. Fernet e' simmetrica: stessa chiave
+# (TOKEN_ENCRYPTION_KEY, generata una volta e salvata su Render) per
+# cifrare e decifrare.
+_google_fernet = None
+if TOKEN_ENCRYPTION_KEY:
+    try:
+        _chiave_fernet = TOKEN_ENCRYPTION_KEY.encode("utf-8") if isinstance(TOKEN_ENCRYPTION_KEY, str) else TOKEN_ENCRYPTION_KEY
+        _google_fernet = Fernet(_chiave_fernet)
+    except Exception:
+        _google_fernet = None
+
+
+def _google_oauth_enabled():
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and _google_fernet and _supabase_enabled())
 
 
 # --- Cloudflare R2 (storage: allegati chat + documenti di addestramento) ------
@@ -954,6 +997,383 @@ def _revoke_remember_tokens(user_id):
         )
     except Exception:
         pass
+
+
+# --- Google Calendar + Gmail: helper di cifratura, lettura/scrittura token,
+# credenziali, chiamate alle API, interfaccia di collegamento in barra
+# laterale, comando in chat. Il flusso OAuth vero e proprio (le due route
+# /oauth/google/start e /oauth/google/callback) vive in serve.py, perche' le
+# route "semplici" di Starlette non hanno accesso a st.session_state; qui in
+# app.py leggiamo/usiamo solo il risultato gia' salvato su Supabase.
+def _encrypt_google_token(value):
+    if not value or not _google_fernet:
+        return None
+    return _google_fernet.encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_google_token(value_enc):
+    if not value_enc or not _google_fernet:
+        return None
+    try:
+        return _google_fernet.decrypt(value_enc.encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _fetch_google_tokens(conn_type, user_id=None):
+    # conn_type: "shared" (account unico di famiglia) oppure "personal"
+    # (uno per ogni membro, richiede user_id).
+    if not _supabase_enabled():
+        return None
+    try:
+        if conn_type == "shared":
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/google_shared_connection",
+                headers=SUPABASE_HEADERS,
+                params={"select": "id,access_token_enc,refresh_token_enc,expires_at,scope,updated_at", "limit": 1},
+                timeout=SUPABASE_TIMEOUT,
+            )
+        else:
+            if not user_id:
+                return None
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/google_personal_connections",
+                headers=SUPABASE_HEADERS,
+                params={
+                    "select": "id,user_id,access_token_enc,refresh_token_enc,expires_at,scope,updated_at",
+                    "user_id": f"eq.{user_id}",
+                },
+                timeout=SUPABASE_TIMEOUT,
+            )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _save_google_tokens(conn_type, user_id, access_token, refresh_token, expires_at_iso, scope):
+    # Aggiorna la riga esistente (trovata via fetch, MAI id=1 fisso: la
+    # colonna id e' "generated always as identity" e Postgres rifiuta valori
+    # manuali senza OVERRIDING SYSTEM VALUE, che PostgREST non manda da solo)
+    # oppure ne crea una nuova se non esiste ancora.
+    if not _supabase_enabled():
+        return False
+    try:
+        payload = {
+            "access_token_enc": _encrypt_google_token(access_token),
+            "expires_at": expires_at_iso,
+            "scope": scope,
+        }
+        if refresh_token:
+            # Google manda il refresh_token solo al primo consenso: se non
+            # arriva di nuovo (rinnovo di un token gia' esistente) non
+            # sovrascriviamo quello gia' salvato.
+            payload["refresh_token_enc"] = _encrypt_google_token(refresh_token)
+        existing = _fetch_google_tokens(conn_type, user_id)
+        headers = dict(SUPABASE_HEADERS)
+        headers["Prefer"] = "return=representation"
+        if conn_type == "shared":
+            table = "google_shared_connection"
+        else:
+            if not user_id:
+                return False
+            table = "google_personal_connections"
+            payload["user_id"] = user_id
+        if existing:
+            r = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers=headers,
+                params={"id": f"eq.{existing['id']}"},
+                json=payload,
+                timeout=SUPABASE_TIMEOUT,
+            )
+        else:
+            r = requests.post(
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers=headers,
+                json=payload,
+                timeout=SUPABASE_TIMEOUT,
+            )
+        r.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def _delete_google_tokens(conn_type, user_id=None):
+    if not _supabase_enabled():
+        return False
+    try:
+        if conn_type == "shared":
+            existing = _fetch_google_tokens("shared")
+            if not existing:
+                return True
+            r = requests.delete(
+                f"{SUPABASE_URL}/rest/v1/google_shared_connection",
+                headers=SUPABASE_HEADERS,
+                params={"id": f"eq.{existing['id']}"},
+                timeout=SUPABASE_TIMEOUT,
+            )
+        else:
+            if not user_id:
+                return False
+            r = requests.delete(
+                f"{SUPABASE_URL}/rest/v1/google_personal_connections",
+                headers=SUPABASE_HEADERS,
+                params={"user_id": f"eq.{user_id}"},
+                timeout=SUPABASE_TIMEOUT,
+            )
+        r.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def _get_google_credentials(conn_type, user_id=None):
+    if not _google_oauth_enabled():
+        return None
+    tokens = _fetch_google_tokens(conn_type, user_id)
+    if not tokens:
+        return None
+    access_token = _decrypt_google_token(tokens.get("access_token_enc"))
+    refresh_token = _decrypt_google_token(tokens.get("refresh_token_enc")) if tokens.get("refresh_token_enc") else None
+    if not access_token:
+        return None
+    creds = Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=GOOGLE_OAUTH_SCOPES,
+    )
+    expires_at = tokens.get("expires_at")
+    if expires_at:
+        try:
+            _dt_scadenza = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            # FIX (verificato empiricamente): google-auth confronta .expiry con
+            # datetime.utcnow(), che e' "naive". Un datetime "aware" qui
+            # solleverebbe TypeError ad ogni controllo di .expired.
+            creds.expiry = _dt_scadenza.replace(tzinfo=None)
+        except Exception:
+            pass
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GoogleAuthRequest())
+            _nuova_scadenza = (creds.expiry.isoformat() + "Z") if creds.expiry else None
+            _save_google_tokens(
+                conn_type, user_id, creds.token, None, _nuova_scadenza,
+                " ".join(creds.scopes) if creds.scopes else tokens.get("scope"),
+            )
+        except Exception:
+            return None
+    return creds
+
+
+def _list_calendar_events(creds, max_results=10):
+    try:
+        service = google_build("calendar", "v3", credentials=creds)
+        now_utc = datetime.now(timezone.utc).isoformat()
+        result = service.events().list(
+            calendarId="primary",
+            timeMin=now_utc,
+            maxResults=max_results,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+        return result.get("items", [])
+    except Exception:
+        return None
+
+
+def _list_recent_emails(creds, limit=5):
+    try:
+        service = google_build("gmail", "v1", credentials=creds)
+        result = service.users().messages().list(userId="me", maxResults=limit, labelIds=["INBOX"]).execute()
+        messages = result.get("messages", [])
+        emails = []
+        for m in messages:
+            msg = service.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            ).execute()
+            headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            emails.append({
+                "id": msg["id"],
+                "threadId": msg.get("threadId"),
+                "from": headers.get("From", ""),
+                "subject": headers.get("Subject", "(senza oggetto)"),
+                "date": headers.get("Date", ""),
+                "snippet": msg.get("snippet", ""),
+            })
+        return emails
+    except Exception:
+        return None
+
+
+def _create_email_draft(creds, to_addr, subject, body_text):
+    try:
+        service = google_build("gmail", "v1", credentials=creds)
+        message = MIMEText(body_text)
+        message["to"] = to_addr
+        message["subject"] = subject
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        return service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
+    except Exception:
+        return None
+
+
+def _send_email_draft(creds, draft_id):
+    try:
+        service = google_build("gmail", "v1", credentials=creds)
+        return service.users().drafts().send(userId="me", body={"id": draft_id}).execute()
+    except Exception:
+        return None
+
+
+def _render_google_connection_ui():
+    st.markdown("---")
+    st.markdown("#### 📅 Collegamenti Google (Calendario e Gmail)")
+    if not _google_oauth_enabled():
+        st.caption("Funzione non ancora attiva: mancano le credenziali Google sul server.")
+        return
+
+    _utente_corrente = st.session_state.current_user
+
+    if IS_PARENT:
+        st.caption("Account condiviso di famiglia (usato quando non e' collegato un account personale).")
+        _shared = _fetch_google_tokens("shared")
+        if _shared:
+            st.success("Account condiviso collegato.")
+            if st.button("Disconnetti account condiviso", key="disconnetti_google_shared"):
+                _delete_google_tokens("shared")
+                st.rerun()
+        else:
+            st.link_button("🔗 Collega account Google condiviso", f"{APP_BASE_URL}/oauth/google/start?type=shared")
+        st.caption("L'accesso a Gmail va ricollegato circa ogni 7 giorni (limite dell'app Google in modalita' di test): basta ricliccare il collegamento quando serve.")
+        st.markdown("---")
+
+    st.caption(f"Il tuo account Google personale ({_utente_corrente.get('name', 'Utente')}).")
+    _personal = _fetch_google_tokens("personal", _utente_corrente.get("id"))
+    if _personal:
+        st.success("Il tuo account personale e' collegato.")
+        if st.button("Disconnetti il mio account", key="disconnetti_google_personal"):
+            _delete_google_tokens("personal", _utente_corrente.get("id"))
+            st.rerun()
+    else:
+        _link_personale = f"{APP_BASE_URL}/oauth/google/start?type=personal&user_id={_utente_corrente.get('id')}&role={CURRENT_ROLE}"
+        st.link_button("🔗 Collega il mio account Google", _link_personale)
+        st.caption("L'accesso a Gmail va ricollegato circa ogni 7 giorni (limite dell'app Google in modalita' di test): basta ricliccare il collegamento quando serve.")
+
+
+def _testo_comando_google(testo):
+    # Rilevamento a parole chiave (non un vero NLU): puo' avere falsi
+    # positivi su frasi generiche che contengono le stesse parole, accettato
+    # come limite noto per la semplicita' dell'implementazione.
+    t = (testo or "").lower()
+    if any(k in t for k in ["rispondi a", "rispondi all'ultima", "prepara una bozza", "scrivi una bozza", "fammi una bozza", "scrivi una risposta"]):
+        return "bozza_risposta"
+    if any(k in t for k in ["leggimi la posta", "leggi la posta", "leggimi le mail", "leggimi le email", "ultime email", "ultime mail", "posta in arrivo", "che email ho"]):
+        return "leggi_posta"
+    if any(k in t for k in ["calendario", "impegni", "agenda", "appuntamenti"]):
+        return "calendario"
+    return None
+
+
+def _scegli_connessione_google(utente):
+    # Preferisce l'account personale dell'utente, se collegato; altrimenti,
+    # solo per i genitori, ricade sull'account condiviso di famiglia.
+    _uid = utente.get("id")
+    if _fetch_google_tokens("personal", _uid):
+        return ("personal", _uid)
+    if utente.get("role") == "genitore" and _fetch_google_tokens("shared"):
+        return ("shared", None)
+    return (None, None)
+
+
+def _handle_google_agent_logic(comando, testo_completo, utente):
+    if not _google_oauth_enabled():
+        return "La connessione con Google non e' ancora configurata su questo server."
+
+    conn_type, conn_user_id = _scegli_connessione_google(utente)
+    if not conn_type:
+        return (
+            "Non risulta ancora nessun account Google collegato (ne' il tuo personale ne' quello di famiglia). "
+            "Puoi collegarlo dalla barra laterale, sezione \"Collegamenti Google\"."
+        )
+    creds = _get_google_credentials(conn_type, conn_user_id)
+    if not creds:
+        return "Non riesco ad accedere al tuo account Google in questo momento: prova a ricollegarlo dalla barra laterale."
+
+    if comando == "calendario":
+        eventi = _list_calendar_events(creds, max_results=10)
+        if eventi is None:
+            return "Non sono riuscito a leggere il calendario in questo momento."
+        if not eventi:
+            return "Non ci sono impegni in programma nel calendario."
+        righe = []
+        for ev in eventi:
+            _inizio = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date") or "?"
+            _titolo = ev.get("summary", "(senza titolo)")
+            righe.append(f"- {_inizio}: {_titolo}")
+        return "Ecco i prossimi impegni nel calendario:\n" + "\n".join(righe)
+
+    if comando == "leggi_posta":
+        emails = _list_recent_emails(creds, limit=5)
+        if emails is None:
+            return "Non sono riuscito a leggere la posta in questo momento."
+        if not emails:
+            return "Non ci sono email recenti nella posta in arrivo."
+        righe = [f"- Da {em['from']} — {em['subject']}: {em['snippet']}" for em in emails]
+        return "Ecco le email piu' recenti:\n" + "\n".join(righe)
+
+    if comando == "bozza_risposta":
+        emails = _list_recent_emails(creds, limit=1)
+        if not emails:
+            return "Non trovo nessuna email recente a cui rispondere."
+        ultima = emails[0]
+        try:
+            _prompt_bozza = (
+                "Scrivi una breve risposta educata in italiano a questa email.\n"
+                f"Da: {ultima['from']}\nOggetto: {ultima['subject']}\nContenuto: {ultima['snippet']}\n\n"
+                f"Indicazioni dell'utente su cosa rispondere: {testo_completo}\n\n"
+                "Scrivi solo il testo della risposta, senza oggetto ne' indicazioni tecniche."
+            )
+            _groq_api_key_locale = os.environ.get("GROQ_API_KEY")
+            _client_bozza = Groq(api_key=_groq_api_key_locale)
+            _completamento = _client_bozza.chat.completions.create(
+                model=FALLBACK_MODEL,
+                messages=[{"role": "user", "content": _prompt_bozza}],
+                max_tokens=400,
+            )
+            _testo_bozza = _completamento.choices[0].message.content
+        except Exception:
+            return "Non sono riuscito a generare il testo della risposta in questo momento."
+
+        _mittente = ultima["from"]
+        _oggetto_risposta = ultima["subject"] or "(senza oggetto)"
+        if not _oggetto_risposta.lower().startswith("re:"):
+            _oggetto_risposta = "Re: " + _oggetto_risposta
+        draft = _create_email_draft(creds, _mittente, _oggetto_risposta, _testo_bozza)
+        if not draft:
+            return "Ho preparato il testo ma non sono riuscito a salvarlo come bozza su Gmail."
+        st.session_state.setdefault("pending_google_drafts", {})
+        st.session_state["pending_google_drafts"][draft["id"]] = {
+            "conn_type": conn_type,
+            "conn_user_id": conn_user_id,
+            "to": _mittente,
+            "subject": _oggetto_risposta,
+            "body": _testo_bozza,
+        }
+        return (
+            f"Ho preparato una bozza di risposta a {_mittente} (oggetto: \"{_oggetto_risposta}\"):\n\n"
+            f"{_testo_bozza}\n\n"
+            "Non l'ho inviata: la trovi anche tra le bozze di Gmail, oppure usa il pulsante di conferma "
+            "qui sopra nella chat per inviarla subito o scartarla."
+        )
+
+    return None
 
 
 def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None, location_text=None, current_user_name=None):
@@ -1989,6 +2409,9 @@ with st.sidebar:
     else:
         st.caption("Il salvataggio permanente degli allegati non e ancora configurato: gli allegati verranno comunque accettati nella chat ma non salvati, finche non vengono aggiunte le credenziali dello spazio di archiviazione.")
 
+    if MEMORIA_PERSISTENTE:
+        _render_google_connection_ui()
+
     if IS_PARENT and MEMORIA_PERSISTENTE:
         st.markdown("---")
         st.markdown("#### 👨‍👩‍👧‍👦 Gestione famiglia")
@@ -2070,6 +2493,34 @@ else:
             "accanto all'indirizzo del sito, apri i permessi e consenti il Microfono, poi ricarica la pagina."
         )
 
+    # Bozze email in attesa di conferma (create dal comando Google in chat):
+    # restano visibili qui, fuori dal normale ciclo dei messaggi, cosi'
+    # sopravvivono a un rerun di Streamlit finche' non vengono inviate o
+    # scartate esplicitamente. Non si invia MAI un'email dal solo testo
+    # scritto in chat: serve sempre questo pulsante di conferma esplicito.
+    _bozze_google_in_sospeso = st.session_state.get("pending_google_drafts") or {}
+    if _bozze_google_in_sospeso:
+        st.markdown("---")
+        st.markdown("##### ✉️ Bozza email in attesa di conferma")
+        for _draft_id, _info in list(_bozze_google_in_sospeso.items()):
+            with st.container(border=True):
+                st.caption(f"A: {_info['to']}  \nOggetto: {_info['subject']}")
+                st.write(_info["body"])
+                _col_invia, _col_scarta = st.columns(2)
+                with _col_invia:
+                    if st.button("✅ Invia", key=f"invia_bozza_{_draft_id}", use_container_width=True):
+                        _creds_invio = _get_google_credentials(_info["conn_type"], _info["conn_user_id"])
+                        if _creds_invio and _send_email_draft(_creds_invio, _draft_id):
+                            st.session_state["pending_google_drafts"].pop(_draft_id, None)
+                            st.success("Email inviata.")
+                            st.rerun()
+                        else:
+                            st.error("Invio non riuscito. Riprova.")
+                with _col_scarta:
+                    if st.button("🗑️ Scarta", key=f"scarta_bozza_{_draft_id}", use_container_width=True):
+                        st.session_state["pending_google_drafts"].pop(_draft_id, None)
+                        st.rerun()
+
     user_input = st.chat_input(
         "Chiedimi qualcosa, usa il microfono o allega un file...",
         accept_file="multiple",
@@ -2106,6 +2557,10 @@ else:
         _file_allegati = user_input.files or []
         _resto_addestramento = _testo_comando_addestramento(testo_completo)
         _comando_addestramento_attivo = _resto_addestramento is not None
+        # Il comando Google (calendario/posta) e' controllato solo se non e'
+        # gia' attivo il comando di addestramento, per evitare ambiguita' tra
+        # i due (l'addestramento ha sempre la precedenza).
+        _comando_google = None if _comando_addestramento_attivo else _testo_comando_google(testo_completo)
 
         if _comando_addestramento_attivo:
             # Il comando "addestramento" salva testo/file nella memoria
@@ -2139,6 +2594,7 @@ else:
         prompt = None
         _input_era_vocale = False
         _comando_addestramento_attivo = False
+        _comando_google = None
 
     # Ora che sappiamo se in questo giro arriva anche una risposta nuova,
     # possiamo riempire (o lasciare vuoto) il segnaposto del pulsante 🔊
@@ -2187,6 +2643,12 @@ else:
                 # direttamente la conferma (o il messaggio d'errore) gia'
                 # preparata sopra durante la gestione dell'allegato/testo.
                 response = risposta_addestramento
+            elif _comando_google:
+                # Comando Google (calendario/posta): niente chiamata al
+                # modello Groq per la risposta principale, si usa Calendar/
+                # Gmail direttamente tramite l'account collegato dall'utente
+                # (o quello condiviso di famiglia, se genitore).
+                response = _handle_google_agent_logic(_comando_google, testo_completo, st.session_state.current_user)
             else:
                 def is_too_large_error(exc):
                     msg = str(exc).lower()
