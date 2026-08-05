@@ -1921,6 +1921,18 @@ st.markdown(f"""
 [data-testid="stHeader"] > div {{
     background: {GRADIENT_CSS} !important;
 }}
+/* Barra colorata animata che Streamlit mostra in cima alla pagina durante il
+   caricamento/ricarica dello script (nativa di Streamlit, non nostra):
+   rimossa su richiesta esplicita dell'utente. Coperti sia il selettore
+   "data-testid" usato dalle versioni piu' recenti sia il vecchio id
+   "stDecoration" usato da versioni precedenti, perche' l'elemento e'
+   transitorio (visibile solo durante l'esecuzione dello script) e non e'
+   stato possibile osservarlo direttamente in questo ambiente di sviluppo
+   (la connessione locale e' troppo veloce perche' compaia). */
+[data-testid="stDecoration"],
+#stDecoration {{
+    display: none !important;
+}}
 /* Spazio di sicurezza per la barra di stato del telefono (notch, isola
    dinamica, orologio) quando l'app e' installata come PWA a schermo intero:
    senza questo padding, sui telefoni con display "edge-to-edge" il contenuto
@@ -2321,7 +2333,7 @@ if st.session_state.get("just_logged_in"):
     st.markdown(f"""
     <div class="carpanet-welcome">
         <img class="carpanet-welcome-logo" src="data:image/jpeg;base64,{LOGO_B64}">
-        <h1>Ciao {_nome_utente} 👋</h1>
+        <h1>Ciao {_nome_utente}!</h1>
         <p class="carpanet-welcome-sub">{_saluto_orario().capitalize()}! Carpanet AI e pronta ad aiutarti.</p>
     </div>
     """, unsafe_allow_html=True)
