@@ -1279,6 +1279,17 @@ def _testo_comando_google(testo):
         return "bozza_risposta"
     if any(k in t for k in ["leggimi la posta", "leggi la posta", "leggimi le mail", "leggimi le email", "ultime email", "ultime mail", "posta in arrivo", "che email ho"]):
         return "leggi_posta"
+    # Riconoscimento piu' ampio: qualunque frase che nomini la posta/email E
+    # contenga un verbo/azione di lettura, anche se non corrisponde a una
+    # delle frasi esatte sopra (es. "mi puoi leggere l'ultima email che e'
+    # arrivata?", che non conteneva nessuna delle frasi letterali attese).
+    _parla_di_posta = any(k in t for k in ["email", "e-mail", "mail", "posta"])
+    _verbo_di_lettura = any(k in t for k in [
+        "leggi", "legger", "mostra", "controlla", "controllami",
+        "hai ricevuto", "che novita", "novita'", "novità", "che c'e' di nuovo",
+    ])
+    if _parla_di_posta and _verbo_di_lettura:
+        return "leggi_posta"
     if any(k in t for k in ["calendario", "impegni", "agenda", "appuntamenti"]):
         return "calendario"
     return None
