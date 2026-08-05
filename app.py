@@ -2,11 +2,12 @@ import os
 import json
 import base64
 import hashlib
+import secrets
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 MEMORY_FILE = "chat_memory.json"
@@ -841,19 +842,118 @@ def _verify_family_login(name, pin):
 
 
 def _create_family_user(name, pin, role):
+    # Ritorna il record creato (con "id") invece di un semplice True/False:
+    # serve a chi crea l'account per poter subito generare un token
+    # "ricordami" senza dover fare una query in piu' per ritrovare l'id.
+    # Nei punti in cui serve solo sapere se e' andato a buon fine, un `if`
+    # sul risultato funziona comunque (None e' falsy, il dict e' truthy).
     if not _supabase_enabled():
-        return False
+        return None
     try:
+        headers = dict(SUPABASE_HEADERS)
+        headers["Prefer"] = "return=representation"
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/family_users",
-            headers=SUPABASE_HEADERS,
+            headers=headers,
             json={"name": name, "pin_hash": _hash_pin(pin), "role": role},
             timeout=SUPABASE_TIMEOUT,
         )
         r.raise_for_status()
-        return True
+        rows = r.json()
+        if rows:
+            return {"id": rows[0]["id"], "name": rows[0]["name"], "role": rows[0]["role"]}
+        return None
     except Exception:
-        return False
+        return None
+
+
+# --- "Ricordami" (accesso automatico senza reinserire il PIN ogni volta) --
+# Schema: al login, se l'utente sceglie "Ricordami", generiamo un token
+# casuale lungo (mai indovinabile). Solo il suo HASH (mai il token in
+# chiaro) viene salvato su Supabase insieme a nome/ruolo e una scadenza; il
+# token vero viene tenuto SOLO nel localStorage del browser dell'utente,
+# mai in un cookie ne' altrove sul server. Ad ogni apertura dell'app, se
+# non si e' gia' loggati, un piccolo script (vedi piu' sotto, stesso schema
+# gia' usato per la posizione) controlla il localStorage: se trova un
+# token lo passa al lato Python tramite l'indirizzo della pagina, che lo
+# verifica contro l'hash salvato e, se valido e non scaduto, effettua il
+# login senza richiedere di nuovo il PIN.
+REMEMBER_TOKEN_GIORNI = 60  # durata del "ricordami": 60 giorni di inattivita'
+
+
+def _hash_remember_token(token):
+    return hashlib.sha256((token + "carpanet_remember_salt_v1").encode("utf-8")).hexdigest()
+
+
+def _create_remember_token(user_id, user_name, role):
+    if not _supabase_enabled():
+        return None
+    try:
+        token = secrets.token_urlsafe(32)
+        scadenza = (datetime.now(timezone.utc) + timedelta(days=REMEMBER_TOKEN_GIORNI)).isoformat()
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/remember_tokens",
+            headers=SUPABASE_HEADERS,
+            json={
+                "user_id": user_id,
+                "user_name": user_name,
+                "role": role,
+                "token_hash": _hash_remember_token(token),
+                "expires_at": scadenza,
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return token
+    except Exception:
+        return None
+
+
+def _verify_remember_token(token):
+    if not _supabase_enabled() or not token:
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/remember_tokens",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "user_id,user_name,role,expires_at",
+                "token_hash": f"eq.{_hash_remember_token(token)}",
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return None
+        row = rows[0]
+        scadenza = row.get("expires_at")
+        if scadenza:
+            try:
+                if datetime.fromisoformat(scadenza.replace("Z", "+00:00")) < datetime.now(timezone.utc):
+                    return None  # token scaduto
+            except Exception:
+                pass
+        return {"id": row["user_id"], "name": row["user_name"], "role": row["role"]}
+    except Exception:
+        return None
+
+
+def _revoke_remember_tokens(user_id):
+    # Chiamata al logout: dimentica tutti i dispositivi "ricordati" per
+    # quell'account, cosi' fare "Esci" significa davvero uscire (non
+    # ripresentarsi loggati in automatico al giro successivo).
+    if not _supabase_enabled() or not user_id:
+        return
+    try:
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/remember_tokens",
+            headers=SUPABASE_HEADERS,
+            params={"user_id": f"eq.{user_id}"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+    except Exception:
+        pass
 
 
 def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None, location_text=None, current_user_name=None):
@@ -1346,6 +1446,21 @@ html, body {{
 [data-testid="stSidebar"] * {{
     color: #f2f6ff !important;
 }}
+/* Il tasto per aprire/chiudere la barra laterale (utile soprattutto da
+   cellulare) restava "dentro" l'elenco delle conversazioni: scorrendo in
+   basso per vedere le conversazioni piu' vecchie, il tasto per richiuderla
+   spariva dallo schermo insieme al resto. [data-testid="stSidebarContent"]
+   e' il contenitore che scorre davvero (verificato: e' lui ad avere
+   overflow-y, non stSidebarUserContent); [data-testid="stSidebarHeader"],
+   che contiene il tasto di chiusura, e' un suo elemento interno. Con
+   "position: sticky; top: 0" resta agganciato in cima mentre il resto
+   scorre sotto di lui, invece di scorrere via insieme al contenuto. */
+[data-testid="stSidebarHeader"] {{
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 999999 !important;
+    background: {GRADIENT_CSS} !important;
+}}
 [data-testid="stCaptionContainer"], .stCaption, small {{
     color: #b9c6e6 !important;
 }}
@@ -1481,20 +1596,33 @@ if st.session_state.user_location is None and not _qp.get("geo_lat") and not _qp
     <script>
     (function () {
         try {
+            // IMPORTANTE (bug scoperto e corretto durante i test del "ricordami"):
+            // l'iframe di components.html e' sandboxato da Streamlit SENZA il permesso
+            // "allow-top-navigation"/"allow-top-navigation-by-user-activation". Impostare
+            // direttamente window.top.location.search da qui viene quindi bloccato dal
+            // browser (nessun errore visibile all'utente, ma la pagina non si aggiornava
+            // mai: la geolocalizzazione automatica non ha mai funzionato). Soluzione: dato
+            // che l'iframe ha "allow-same-origin", puo' comunque scrivere liberamente nel
+            // documento reale (window.top.document); iniettando li' un vero tag <script>,
+            // quello script viene eseguito come parte della pagina reale (non sandboxata),
+            // e da li' la navigazione e' permessa senza restrizioni.
+            function naviga(params) {
+                var topDoc = window.top.document;
+                var s = topDoc.createElement('script');
+                s.textContent = "(function(){try{var u=new URL(window.location.href);var p=" +
+                    JSON.stringify(params) +
+                    ";for(var k in p){u.searchParams.set(k,p[k]);}window.location.href=u.toString();}catch(e){}})();";
+                topDoc.head.appendChild(s);
+            }
             var here = new URLSearchParams(window.top.location.search);
             if (here.has('geo_lat') || here.has('geo_denied')) { return; }
             if (!navigator.geolocation) { return; }
             navigator.geolocation.getCurrentPosition(
                 function (pos) {
-                    var p = new URLSearchParams(window.top.location.search);
-                    p.set('geo_lat', pos.coords.latitude);
-                    p.set('geo_lon', pos.coords.longitude);
-                    window.top.location.search = p.toString();
+                    naviga({geo_lat: pos.coords.latitude, geo_lon: pos.coords.longitude});
                 },
                 function () {
-                    var p = new URLSearchParams(window.top.location.search);
-                    p.set('geo_denied', '1');
-                    window.top.location.search = p.toString();
+                    naviga({geo_denied: '1'});
                 },
                 { timeout: 8000, maximumAge: 600000 }
             );
@@ -1511,6 +1639,56 @@ if st.session_state.user_location is None and not _qp.get("geo_lat") and not _qp
 if "current_user" not in st.session_state:
     st.session_state.current_user = None
 
+# --- "Ricordami": accesso automatico se un token valido arriva dall'indirizzo
+# della pagina (messo li' dallo script piu' sotto, che lo legge dal
+# localStorage del browser). Va fatto PRIMA di mostrare il modulo di login,
+# cosi' chi ha gia' un token valido non vede proprio la schermata del PIN.
+_remember_invalidate_needed = st.session_state.pop("_forget_device_on_next_run", False)
+if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
+    _rt = st.query_params.get("remember_token")
+    if _rt:
+        _remembered = _verify_remember_token(_rt)
+        st.query_params.pop("remember_token", None)  # mai lasciarlo visibile nell'indirizzo
+        if _remembered:
+            st.session_state.current_user = _remembered
+            st.session_state.just_logged_in = True
+            st.rerun()
+        else:
+            # Token assente/scaduto/revocato: puliamo anche il localStorage,
+            # altrimenti si ritenterebbe lo stesso token morto a ogni apertura.
+            _remember_invalidate_needed = True
+
+if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
+    st.components.v1.html(f"""
+    <script>
+    (function () {{
+        try {{
+            if ({"true" if _remember_invalidate_needed else "false"}) {{
+                window.top.localStorage.removeItem('carpanet_remember_token');
+                return;
+            }}
+            var here = new URLSearchParams(window.top.location.search);
+            if (here.has('remember_token')) {{ return; }}
+            var t = window.top.localStorage.getItem('carpanet_remember_token');
+            if (t) {{
+                // Stesso fix del blocco geolocalizzazione qui sopra: l'iframe di
+                // components.html non ha il permesso di navigare window.top
+                // direttamente (sandbox senza "allow-top-navigation"). Iniettiamo
+                // quindi un vero <script> nel documento reale (window.top.document,
+                // raggiungibile grazie a "allow-same-origin"), che esegue la
+                // navigazione come parte della pagina vera, non sandboxata.
+                var topDoc = window.top.document;
+                var s = topDoc.createElement('script');
+                s.textContent = "(function(){{try{{var u=new URL(window.location.href);u.searchParams.set('remember_token'," +
+                    JSON.stringify(t) +
+                    ");window.location.href=u.toString();}}catch(e){{}}}})();";
+                topDoc.head.appendChild(s);
+            }}
+        }} catch (e) {{}}
+    }})();
+    </script>
+    """, height=0)
+
 if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
     st.markdown("## AI privata")
     existing_users = _load_family_users()
@@ -1519,12 +1697,18 @@ if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
         with st.form("bootstrap_parent_form"):
             new_name = st.text_input("Il tuo nome")
             new_pin = st.text_input("Scegli un PIN (4-6 cifre)", type="password")
+            new_ricordami = st.checkbox("Ricordami su questo dispositivo (non richiedere piu' il PIN)")
             submitted = st.form_submit_button("Crea account genitore")
             if submitted:
                 if new_name.strip() and new_pin.strip():
-                    if _create_family_user(new_name.strip(), new_pin.strip(), "genitore"):
-                        st.session_state.current_user = {"name": new_name.strip(), "role": "genitore"}
+                    _nuovo = _create_family_user(new_name.strip(), new_pin.strip(), "genitore")
+                    if _nuovo:
+                        st.session_state.current_user = _nuovo
                         st.session_state.just_logged_in = True
+                        if new_ricordami:
+                            _tok = _create_remember_token(_nuovo["id"], _nuovo["name"], _nuovo["role"])
+                            if _tok:
+                                st.session_state["_remember_token_to_store"] = _tok
                         st.rerun()
                     else:
                         st.error("Errore nella creazione dell'account. Riprova.")
@@ -1535,12 +1719,17 @@ if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
         with st.form("login_form"):
             selected_name = st.selectbox("Chi sei?", names)
             pin_input = st.text_input("PIN", type="password")
+            ricordami = st.checkbox("Ricordami su questo dispositivo (non richiedere piu' il PIN)")
             submitted = st.form_submit_button("Accedi")
             if submitted:
                 user = _verify_family_login(selected_name, pin_input)
                 if user:
                     st.session_state.current_user = user
                     st.session_state.just_logged_in = True
+                    if ricordami:
+                        _tok = _create_remember_token(user["id"], user["name"], user["role"])
+                        if _tok:
+                            st.session_state["_remember_token_to_store"] = _tok
                     st.rerun()
                 else:
                     st.error("PIN errato.")
@@ -1555,6 +1744,18 @@ IS_PARENT = CURRENT_ROLE == "genitore"
 
 # --- Pagina di benvenuto (a ogni login, prima della chat) -----------------
 if st.session_state.get("just_logged_in"):
+    # Se al login e' stato scelto "Ricordami", il token generato in quel
+    # momento viene scritto ora nel localStorage del browser (qui, e non
+    # subito prima del rerun del login, perche' questa pagina resta
+    # visibile per un momento e da' il tempo allo script di essere davvero
+    # eseguito dal browser prima di un'eventuale nuova ricarica).
+    _token_da_salvare = st.session_state.pop("_remember_token_to_store", None)
+    if _token_da_salvare:
+        st.components.v1.html(f"""
+        <script>
+        try {{ window.top.localStorage.setItem('carpanet_remember_token', {json.dumps(_token_da_salvare)}); }} catch (e) {{}}
+        </script>
+        """, height=0)
     _nome_utente = st.session_state.current_user.get("name", "")
     st.markdown(f"""
     <div class="carpanet-welcome">
@@ -1585,6 +1786,15 @@ with st.sidebar:
         role_label = "Genitore (accesso completo)" if IS_PARENT else "Figlio (accesso limitato)"
         st.caption(f"👤 {user_name} — {role_label}")
         if st.button("Esci"):
+            # "Esci" annulla anche il "Ricordami" su questo dispositivo:
+            # altrimenti al giro successivo il token salvato rieffettuerebbe
+            # subito il login da solo, vanificando l'uscita esplicita. La
+            # cancellazione vera e propria del localStorage avviene al giro
+            # successivo (vedi blocco "Ricordami" sopra), non qui: uno script
+            # appena prima di un rerun immediato rischierebbe di non fare in
+            # tempo a essere eseguito dal browser.
+            _revoke_remember_tokens(st.session_state.current_user.get("id"))
+            st.session_state["_forget_device_on_next_run"] = True
             st.session_state.current_user = None
             st.rerun()
         st.caption("La memoria e collegata a un database esterno: la cronologia resta anche se Render riavvia il servizio. Al modello viene comunque inviata solo la parte piu recente per evitare errori.")
