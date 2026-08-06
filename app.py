@@ -1509,6 +1509,47 @@ def _crea_documento_verbale(creds, testo, titolo, cartella_id):
         return None
 
 
+def _crea_evento_calendario_generico(creds, titolo, data_str, ora_str=None):
+    # Backing reale per il tool "crea_promemoria_calendario": crea un evento
+    # vero su Google Calendar, per data intera (promemoria/appuntamento senza
+    # ora precisa) oppure con un orario specifico (durata di default 1 ora).
+    # La data arriva gia' come AAAA-MM-GG (il classificatore la calcola da
+    # espressioni relative tipo "domani" usando la data odierna nel contesto),
+    # ma viene comunque validata qui prima di chiamare Google: mai passare
+    # un valore non verificato a un'azione con effetti reali.
+    try:
+        _data = datetime.strptime((data_str or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    try:
+        calendar_service = google_build("calendar", "v3", credentials=creds)
+        if ora_str:
+            try:
+                _ora = datetime.strptime(ora_str.strip(), "%H:%M").time()
+            except ValueError:
+                _ora = None
+        else:
+            _ora = None
+        if _ora:
+            _inizio = datetime.combine(_data, _ora, tzinfo=ZoneInfo("Europe/Rome"))
+            _fine = _inizio + timedelta(hours=1)
+            evento = {
+                "summary": titolo,
+                "start": {"dateTime": _inizio.isoformat()},
+                "end": {"dateTime": _fine.isoformat()},
+            }
+        else:
+            evento = {
+                "summary": titolo,
+                "start": {"date": _data.strftime("%Y-%m-%d")},
+                "end": {"date": (_data + timedelta(days=1)).strftime("%Y-%m-%d")},
+            }
+        return calendar_service.events().insert(calendarId="primary", body=evento).execute()
+    except Exception as e:
+        print(f"[calendario] creazione evento fallita: {e}", flush=True)
+        return None
+
+
 def _crea_promemoria_scadenza_verbale(creds, nome_file, scadenza_dt):
     try:
         calendar_service = google_build("calendar", "v3", credentials=creds)
@@ -1802,6 +1843,22 @@ GOOGLE_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "crea_promemoria_calendario",
+            "description": "Crea un nuovo evento/promemoria/appuntamento sul calendario (personale o di famiglia). Usa questo per qualunque richiesta di aggiungere qualcosa in agenda: 'aggiungi un promemoria', 'segnami in calendario', 'ricordami di...', 'metti un appuntamento...'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titolo": {"type": "string", "description": "Titolo breve dell'evento/promemoria (es. 'Dentista', 'Ritira pacco', 'Chiama Mario')."},
+                    "data": {"type": "string", "description": "Data dell'evento in formato AAAA-MM-GG (es. 2026-08-10). Se l'utente usa un'espressione relativa (es. 'domani', 'venerdi' prossimo', 'tra due giorni'), calcolala tu partendo dalla data odierna indicata nel contesto della conversazione: non lasciarla mai relativa."},
+                    "ora": {"type": "string", "description": "Ora dell'evento in formato HH:MM (24 ore), es. '15:30'. Lascia vuoto/omesso se l'utente non specifica un orario preciso: verra' creato come promemoria per l'intera giornata."},
+                },
+                "required": ["titolo", "data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "leggi_posta",
             "description": "Legge le ultime email ricevute. Non richiede parametri.",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -1923,6 +1980,9 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
         "Sei il modulo di riconoscimento intenti di Carpanet AI, assistente di famiglia. Il tuo unico compito e' "
         "decidere se il messaggio dell'utente vuole attivare una delle azioni disponibili (tools) - non devi "
         "rispondere nel merito, ne' conversare.\n\n"
+        f"{_contesto_temporale()} Usa questa data odierna per calcolare qualunque espressione relativa "
+        "('domani', 'dopodomani', 'venerdi' prossimo', 'tra tre giorni', ecc.) quando devi passare una data assoluta "
+        "a un tool (es. crea_promemoria_calendario): non lasciare mai una data relativa nei parametri.\n\n"
         "REGOLE FERREE:\n"
         "1. Se il messaggio corrisponde chiaramente a un'azione E hai tutti i parametri richiesti (es. indirizzo "
         "email esplicito, articoli specifici, nome del verbale), chiama il tool corrispondente con quegli argomenti.\n"
@@ -2109,6 +2169,18 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
             righe.append(f"- {_inizio}: {_titolo}")
         return "Ecco i prossimi impegni nel calendario:\n" + "\n".join(righe) + _nota_fonte
 
+    if azione_nome == "crea_promemoria_calendario":
+        _titolo_evento = (argomenti.get("titolo") or "").strip()
+        _data_evento = (argomenti.get("data") or "").strip()
+        _ora_evento = (argomenti.get("ora") or "").strip() or None
+        if not _titolo_evento or not _data_evento:
+            return "Non ho capito bene cosa devo segnare in calendario o per quando: puoi ripetere con titolo e data (anche relativa, tipo \"domani\")?"
+        _evento_creato = _crea_evento_calendario_generico(creds, _titolo_evento, _data_evento, _ora_evento)
+        if not _evento_creato:
+            return "Non sono riuscito a creare l'evento nel calendario: la data indicata potrebbe non essere valida, o il collegamento con Google potrebbe aver bisogno di essere rinnovato."
+        _quando = _data_evento + (f" alle {_ora_evento}" if _ora_evento else " (per l'intera giornata)")
+        return f"✅ Aggiunto al calendario: \"{_titolo_evento}\" — {_quando}." + _nota_fonte
+
     if azione_nome == "lista_spesa_aggiungi":
         _articoli = argomenti.get("articoli") or []
         if not _articoli:
@@ -2139,11 +2211,20 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
     if azione_nome == "scrivi_nuova_email":
         # Il modello estrae gia' l'indirizzo dal messaggio, ma non ci si fida
         # mai ciecamente di un dato "libero" restituito da un LLM per
-        # un'azione con effetti reali: lo si ri-valida qui con _RE_INDIRIZZO_EMAIL,
-        # estraendo solo la parte che sembra davvero un indirizzo email
-        # (tollera eventuale testo extra intorno, es. "a: mario@rossi.it").
+        # un'azione con effetti reali. Due controlli, non uno solo:
+        # 1) il formato dev'essere quello di un indirizzo email vero
+        #    (_RE_INDIRIZZO_EMAIL, tollera testo extra intorno come "a: ...");
+        # 2) quell'indirizzo deve comparire LETTERALMENTE nel messaggio
+        #    dell'utente (case-insensitive) - senza questo secondo controllo,
+        #    un modello di function calling puo' "completare" un indirizzo
+        #    plausibile ma inventato (es. da un nome proprio come "Massimo
+        #    Laucci") che supera comunque il controllo di formato: e' lo
+        #    stesso tipo di allucinazione che il blocco nella chat generica
+        #    previene altrove, qui va prevenuta anche nei parametri estratti.
         _match_indirizzo = _RE_INDIRIZZO_EMAIL.search((argomenti.get("destinatario") or "").strip())
         _destinatario = _match_indirizzo.group(0) if _match_indirizzo else None
+        if _destinatario and _destinatario.lower() not in (testo_completo or "").lower():
+            _destinatario = None
         _indicazioni = argomenti.get("indicazioni") or ""
         if not _destinatario:
             return (

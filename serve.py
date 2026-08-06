@@ -31,10 +31,16 @@ import base64
 
 import requests
 import streamlit as st
-from starlette.responses import Response, RedirectResponse, HTMLResponse, PlainTextResponse
+from starlette.responses import Response, RedirectResponse, HTMLResponse, PlainTextResponse, JSONResponse
 from starlette.routing import Route
 from cryptography.fernet import Fernet
 from google_auth_oauthlib.flow import Flow
+
+# Bot Telegram + Smart Morning Briefing: la logica Google (calendario/lista
+# della spesa) e la classificazione d'intento vivono in google_agent_core.py,
+# non in app.py - vedi il commento in cima a quel file per il perche' (app.py
+# e' uno script Streamlit, non importabile come libreria da qui).
+import google_agent_core as gac
 
 SW_JS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "sw.js")
 
@@ -293,12 +299,175 @@ async def oauth_callback(request):
     """)
 
 
+# --- Bot Telegram + Smart Morning Briefing ----------------------------------
+# Architettura a webhook (non polling): Telegram manda una POST ad ogni nuovo
+# messaggio, invece di tenere un processo separato sempre acceso a chiedere
+# "ci sono novita'?" (application.run_polling(...), come nella prima bozza).
+# Un processo di polling avrebbe richiesto un secondo servizio Render sempre
+# attivo (probabilmente a pagamento, dato che il piano gratuito attuale va in
+# stand-by quando non riceve richieste): il webhook invece e' solo un'altra
+# rotta di questo stesso servizio, senza bisogno di nulla in piu'.
+#
+# TELEGRAM_BOT_TOKEN: da ottenere parlando con @BotFather su Telegram (serve
+# un'azione dell'utente, non automatizzabile da qui) e da impostare come
+# variabile d'ambiente su Render.
+# TELEGRAM_WEBHOOK_SECRET: stringa a scelta (es. generata a caso), messa
+# nell'indirizzo del webhook registrato su Telegram, cosi' che questa rotta
+# rifiuti richieste che non arrivano davvero da Telegram.
+# CRON_SECRET: stessa idea, ma per proteggere /cron/morning-briefing (chiamata
+# da uno scheduler esterno una volta al giorno, non da Telegram).
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+CRON_SECRET = os.environ.get("CRON_SECRET")
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
+
+
+def _telegram_pronto():
+    return bool(TELEGRAM_API_BASE and TELEGRAM_WEBHOOK_SECRET and SUPABASE_HEADERS)
+
+
+def _telegram_invia_messaggio(chat_id, testo):
+    if not TELEGRAM_API_BASE:
+        return False
+    try:
+        r = requests.post(
+            f"{TELEGRAM_API_BASE}/sendMessage",
+            json={"chat_id": chat_id, "text": testo},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[telegram] invio messaggio fallito: {e}", flush=True)
+        return False
+
+
+def _telegram_utente_da_id(telegram_id):
+    if not SUPABASE_HEADERS:
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/family_users",
+            headers=SUPABASE_HEADERS,
+            params={"select": "id,name,role,telegram_id", "telegram_id": f"eq.{telegram_id}"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        righe = r.json()
+        return righe[0] if righe else None
+    except Exception as e:
+        print(f"[telegram] lettura utente fallita: {e}", flush=True)
+        return None
+
+
+def _telegram_utenti_con_id_collegato():
+    if not SUPABASE_HEADERS:
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/family_users",
+            headers=SUPABASE_HEADERS,
+            params={"select": "id,name,role,telegram_id", "telegram_id": "not.is.null"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json() or []
+    except Exception as e:
+        print(f"[telegram] lettura utenti collegati fallita: {e}", flush=True)
+        return []
+
+
+def _telegram_trascrivi_audio(file_id):
+    """Scarica un vocale Telegram (file_id) e lo trascrive con lo stesso
+    modello Whisper gia' usato dalla chat principale (app.py)."""
+    try:
+        r = requests.get(f"{TELEGRAM_API_BASE}/getFile", params={"file_id": file_id}, timeout=15)
+        r.raise_for_status()
+        _file_path = r.json()["result"]["file_path"]
+        _url_file = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{_file_path}"
+        _audio_bytes = requests.get(_url_file, timeout=30).content
+        from groq import Groq
+        _client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        _trascrizione = _client.audio.transcriptions.create(
+            model="whisper-large-v3", file=("audio.ogg", _audio_bytes), language="it",
+        )
+        return (_trascrizione.text or "").strip()
+    except Exception as e:
+        print(f"[telegram] trascrizione audio fallita: {e}", flush=True)
+        return ""
+
+
+async def telegram_webhook(request):
+    _secret_url = request.path_params.get("secret", "")
+    if not _telegram_pronto() or not hmac.compare_digest(_secret_url, TELEGRAM_WEBHOOK_SECRET or ""):
+        return PlainTextResponse("Non trovato.", status_code=404)
+    try:
+        update = await request.json()
+    except Exception:
+        return JSONResponse({"ok": True})
+
+    _messaggio = update.get("message") or update.get("edited_message")
+    if not _messaggio:
+        return JSONResponse({"ok": True})  # altri tipi di update (es. callback_query) ignorati per ora
+
+    _chat_id = _messaggio.get("chat", {}).get("id")
+    _telegram_id = _messaggio.get("from", {}).get("id")
+    if not _chat_id or not _telegram_id:
+        return JSONResponse({"ok": True})
+
+    _utente = _telegram_utente_da_id(_telegram_id)
+    if not _utente:
+        _telegram_invia_messaggio(
+            _chat_id,
+            "Non riconosco questo account Telegram: collegalo prima dall'app web, sezione \"Collegamenti Google\" "
+            "(a breve anche un collegamento diretto Telegram), oppure chiedi a chi gestisce l'app di aggiungerlo.",
+        )
+        return JSONResponse({"ok": True})
+
+    _testo = (_messaggio.get("text") or "").strip()
+    if not _testo and _messaggio.get("voice"):
+        _testo = _telegram_trascrivi_audio(_messaggio["voice"]["file_id"])
+        if not _testo:
+            _telegram_invia_messaggio(_chat_id, "Non sono riuscito a trascrivere il vocale: puoi riprovare o scrivere il messaggio?")
+            return JSONResponse({"ok": True})
+    if not _testo:
+        return JSONResponse({"ok": True})
+
+    try:
+        _risposta = gac.elabora_messaggio_telegram(_testo, _utente)
+    except Exception as e:
+        print(f"[telegram] elaborazione messaggio fallita: {e}", flush=True)
+        _risposta = "Mi dispiace, si e' verificato un errore: riprova tra poco."
+    _telegram_invia_messaggio(_chat_id, _risposta or "Non ho una risposta per questo, mi dispiace.")
+    return JSONResponse({"ok": True})
+
+
+async def cron_morning_briefing(request):
+    if not CRON_SECRET or request.query_params.get("secret") != CRON_SECRET:
+        return PlainTextResponse("Non trovato.", status_code=404)
+    if not _telegram_pronto():
+        return PlainTextResponse("Bot Telegram non configurato.", status_code=500)
+    _utenti = _telegram_utenti_con_id_collegato()
+    _inviati = 0
+    for _u in _utenti:
+        try:
+            _testo_briefing = gac.genera_morning_briefing(_u)
+        except Exception as e:
+            print(f"[cron] briefing fallito per {_u.get('name')}: {e}", flush=True)
+            _testo_briefing = None
+        if _testo_briefing and _telegram_invia_messaggio(_u["telegram_id"], _testo_briefing):
+            _inviati += 1
+    return JSONResponse({"ok": True, "inviati": _inviati, "totale_utenti": len(_utenti)})
+
+
 app = st.App(
     "app.py",
     routes=[
         Route("/sw.js", _service_worker_endpoint, methods=["GET"]),
         Route("/oauth/google/start", oauth_start, methods=["GET"]),
         Route("/oauth/google/callback", oauth_callback, methods=["GET"]),
+        Route("/webhook/telegram/{secret}", telegram_webhook, methods=["POST"]),
+        Route("/cron/morning-briefing", cron_morning_briefing, methods=["GET"]),
     ],
 )
 
