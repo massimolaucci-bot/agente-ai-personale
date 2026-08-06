@@ -65,6 +65,8 @@ GOOGLE_OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 # access_token/refresh_token sono piu' sensibili dei PIN/token "ricordami"
@@ -1238,9 +1240,189 @@ def _send_email_draft(creds, draft_id):
         return None
 
 
+# --- Google Sheets: lista della spesa condivisa ------------------------------
+# Round 13: aggiunta su richiesta dell'utente (roadmap "Fase 1: Google
+# Sheets"). Usa lo scope "drive.file" (non il piu' ampio "drive"): l'app puo'
+# vedere/modificare SOLO i file che ha creato lei stessa, mai l'intero Drive
+# dell'utente — piu' sicuro, e sufficiente per un foglio che l'app crea e
+# gestisce da sola.
+_NOME_FOGLIO_LISTA_SPESA = "Lista_Spesa_Carpanet"
+_NOME_SCHEDA_LISTA_SPESA = "Attiva"
+_INTESTAZIONI_LISTA_SPESA = ["Data", "Articolo", "Categoria", "Stato", "Richiesto da"]
+
+_CATEGORIE_SPESA = {
+    "caffe": "Bevande", "caffè": "Bevande", "acqua": "Bevande", "vino": "Bevande", "birra": "Bevande",
+    "latte": "Latte & Derivati", "yogurt": "Latte & Derivati", "formaggio": "Latte & Derivati", "burro": "Latte & Derivati",
+    "pasta": "Pasta & Riso", "riso": "Pasta & Riso",
+    "pane": "Panificio", "pizza": "Panificio",
+    "uova": "Uova",
+    "pomodoro": "Conserve", "passata": "Conserve",
+    "carne": "Macelleria", "pollo": "Macelleria", "salumi": "Macelleria", "prosciutto": "Macelleria",
+    "verdura": "Frutta & Verdura", "frutta": "Frutta & Verdura", "insalata": "Frutta & Verdura",
+    "detersivo": "Pulizia casa", "sapone": "Igiene", "shampoo": "Igiene", "dentifricio": "Igiene",
+}
+
+
+def _categoria_articolo_spesa(articolo):
+    _a = (articolo or "").lower()
+    for _parola, _categoria in _CATEGORIE_SPESA.items():
+        if _parola in _a:
+            return _categoria
+    return "Varie"
+
+
+def _trova_o_crea_foglio_spesa(creds):
+    # Cerca un foglio con questo nome tra quelli GIA' creati dall'app (lo
+    # scope "drive.file" non permette di vedere altri file dell'utente):
+    # se non c'e', ne crea uno nuovo con la scheda "Attiva" gia' pronta e le
+    # intestazioni corrette — senza questo, la scheda di default creata da
+    # Google Sheets si sarebbe chiamata "Foglio1"/"Sheet1", non "Attiva", e
+    # ogni lettura/scrittura successiva sarebbe fallita con un errore di
+    # intervallo non trovato.
+    drive_service = google_build("drive", "v3", credentials=creds)
+    risultati = drive_service.files().list(
+        q=f"name='{_NOME_FOGLIO_LISTA_SPESA}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+        fields="files(id, name)",
+    ).execute()
+    trovati = risultati.get("files", [])
+    if trovati:
+        return trovati[0]["id"]
+
+    sheets_service = google_build("sheets", "v4", credentials=creds)
+    nuovo = sheets_service.spreadsheets().create(body={
+        "properties": {"title": _NOME_FOGLIO_LISTA_SPESA},
+        "sheets": [{"properties": {"title": _NOME_SCHEDA_LISTA_SPESA}}],
+    }).execute()
+    spreadsheet_id = nuovo["spreadsheetId"]
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{_NOME_SCHEDA_LISTA_SPESA}!A:E",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [_INTESTAZIONI_LISTA_SPESA]},
+    ).execute()
+    return spreadsheet_id
+
+
+def _estrai_articoli_spesa(testo, dopo_parole):
+    # Estrae la lista di articoli dal testo dopo la prima parola-chiave
+    # trovata (es. "aggiungi" in "aggiungi caffe' e latte alla spesa" ->
+    # ["caffe'", "latte"]). Nessun vero NLU: stesso limite gia' accettato nel
+    # resto del progetto per il riconoscimento comandi.
+    t = (testo or "").lower()
+    for _parola in dopo_parole:
+        if _parola in t:
+            _dopo = t.split(_parola, 1)[1]
+            # Si ferma a "alla spesa"/"alla lista"/"nella lista" se presente,
+            # per non includerla come se fosse un articolo.
+            for _fine in [" alla lista della spesa", " alla spesa", " nella lista", " alla lista"]:
+                if _fine in _dopo:
+                    _dopo = _dopo.split(_fine, 1)[0]
+            _pezzi = re.split(r",| e ", _dopo)
+            articoli = [p.strip(" .,!?'’") for p in _pezzi]
+            articoli = [a for a in articoli if len(a) > 1]
+            if articoli:
+                return articoli
+    return []
+
+
+def _gestisci_lista_spesa(creds, azione, articoli, nome_utente):
+    try:
+        spreadsheet_id = _trova_o_crea_foglio_spesa(creds)
+        sheets_service = google_build("sheets", "v4", credentials=creds)
+        dati = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{_NOME_SCHEDA_LISTA_SPESA}!A:E",
+        ).execute().get("values", [])
+        righe = dati[1:] if len(dati) > 1 else []  # salta l'intestazione
+
+        if azione == "aggiungi":
+            if not articoli:
+                return "Dimmi anche cosa aggiungere, ad esempio \"aggiungi latte e pane alla lista della spesa\"."
+            _attivi = {r[1].strip().lower() for r in righe if len(r) > 3 and r[3].lower() != "comprato" and len(r) > 1}
+            _oggi = datetime.now(ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y")
+            _nuove_righe = []
+            _gia_presenti = []
+            for _articolo in articoli:
+                if _articolo.lower() in _attivi:
+                    _gia_presenti.append(_articolo)
+                    continue
+                _nuove_righe.append([_oggi, _articolo, _categoria_articolo_spesa(_articolo), "Da comprare", nome_utente or "?"])
+            if _nuove_righe:
+                sheets_service.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id, range=f"{_NOME_SCHEDA_LISTA_SPESA}!A:E",
+                    valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+                    body={"values": _nuove_righe},
+                ).execute()
+            _msg = ""
+            if _nuove_righe:
+                _msg += "Aggiunti alla lista della spesa: " + ", ".join(r[1] for r in _nuove_righe) + "."
+            if _gia_presenti:
+                _msg += (" " if _msg else "") + "Gia' presenti (non duplicati): " + ", ".join(_gia_presenti) + "."
+            return _msg or "Nessun articolo aggiunto."
+
+        if azione == "mostra":
+            _da_comprare = {}
+            for r in righe:
+                if len(r) > 3 and r[3].lower() != "comprato":
+                    _cat = r[2] if len(r) > 2 and r[2] else "Varie"
+                    _chi = r[4] if len(r) > 4 else ""
+                    _da_comprare.setdefault(_cat, []).append(f"{r[1]}" + (f" (richiesto da {_chi})" if _chi else ""))
+            if not _da_comprare:
+                return "La lista della spesa e' vuota: tutto e' gia' stato comprato! 🎉"
+            _righe_risposta = ["🛒 **Lista della spesa**:"]
+            for _cat in sorted(_da_comprare):
+                _righe_risposta.append(f"\n**{_cat}**")
+                _righe_risposta.extend(f"- {a}" for a in _da_comprare[_cat])
+            return "\n".join(_righe_risposta)
+
+        if azione == "comprato":
+            if not articoli:
+                return "Dimmi cosa hai comprato, ad esempio \"ho comprato il latte\"."
+            _aggiornamenti = []
+            for _i, r in enumerate(righe, start=2):  # riga 1 = intestazione
+                if len(r) < 2:
+                    continue
+                if len(r) > 3 and r[3].lower() == "comprato":
+                    continue
+                if any(art.lower() in r[1].lower() for art in articoli):
+                    _aggiornamenti.append({"range": f"{_NOME_SCHEDA_LISTA_SPESA}!D{_i}", "values": [["Comprato"]]})
+            if not _aggiornamenti:
+                return "Non ho trovato questi articoli nella lista attiva."
+            sheets_service.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id, body={"data": _aggiornamenti, "valueInputOption": "USER_ENTERED"},
+            ).execute()
+            return f"Segnati come comprati: {', '.join(articoli)}."
+
+        return None
+    except GoogleHttpError as e:
+        if getattr(e, "status_code", None) == 403 or " 403" in str(e) or "insufficient" in str(e).lower():
+            print(f"[google] _gestisci_lista_spesa: permesso Fogli Google mancante: {e}", flush=True)
+            return (
+                "Per usare la lista della spesa serve un permesso in piu' (Fogli Google) che il tuo collegamento "
+                "attuale non ha ancora: vai in barra laterale, sezione \"Collegamenti Google\", disconnetti e "
+                "ricollega il tuo account per concederlo."
+            )
+        print(f"[google] _gestisci_lista_spesa fallita: {e}", flush=True)
+        return "Non sono riuscito ad accedere alla lista della spesa in questo momento."
+    except Exception as e:
+        print(f"[google] _gestisci_lista_spesa fallita: {e}", flush=True)
+        return "Non sono riuscito ad accedere alla lista della spesa in questo momento."
+
+
+def _connessione_ha_scope_sheets(tokens):
+    # Un account collegato PRIMA del round 13 non ha mai concesso il
+    # permesso sui Fogli Google (scope aggiunto solo ora): senza questo
+    # controllo l'utente scoprirebbe il problema solo al primo tentativo
+    # fallito di usare la lista della spesa, con un errore poco chiaro.
+    if not tokens:
+        return True  # non ancora collegato: nessun avviso di "manca il permesso", solo "collega"
+    _scope = (tokens.get("scope") or "")
+    return "spreadsheets" in _scope
+
+
 def _render_google_connection_ui():
     st.markdown("---")
-    st.markdown("#### 📅 Collegamenti Google (Calendario e Gmail)")
+    st.markdown("#### 📅 Collegamenti Google (Calendario, Gmail e Fogli)")
     if not _google_oauth_enabled():
         st.caption("Funzione non ancora attiva: mancano le credenziali Google sul server.")
         return
@@ -1254,6 +1436,8 @@ def _render_google_connection_ui():
         _shared = _fetch_google_tokens("shared")
         if _shared:
             st.success("Account condiviso collegato.")
+            if not _connessione_ha_scope_sheets(_shared):
+                st.warning("Collegato prima dell'aggiunta della lista della spesa: ricollega per usare anche i Fogli Google.")
             if st.button("Disconnetti account condiviso", key="disconnetti_google_shared"):
                 _delete_google_tokens("shared")
                 st.rerun()
@@ -1263,10 +1447,12 @@ def _render_google_connection_ui():
         st.markdown("---")
 
     st.caption(f"Il tuo account Google personale ({_utente_corrente.get('name', 'Utente')}): usato di default per le tue richieste "
-               "(es. \"che email ho?\", \"che impegni ho oggi?\"). Puoi averlo collegato insieme a quello di famiglia qui sopra.")
+               "(es. \"che email ho?\", \"che impegni ho oggi?\", \"lista della spesa\"). Puoi averlo collegato insieme a quello di famiglia qui sopra.")
     _personal = _fetch_google_tokens("personal", _utente_corrente.get("id"))
     if _personal:
         st.success("Il tuo account personale e' collegato.")
+        if not _connessione_ha_scope_sheets(_personal):
+            st.warning("Collegato prima dell'aggiunta della lista della spesa: ricollega per usare anche i Fogli Google.")
         if st.button("Disconnetti il mio account", key="disconnetti_google_personal"):
             _delete_google_tokens("personal", _utente_corrente.get("id"))
             st.rerun()
@@ -1305,6 +1491,15 @@ def _testo_comando_google(testo):
     ])
     if _parla_di_posta and _verbo_di_lettura:
         return "leggi_posta"
+    # Lista della spesa (Google Sheets): controllata DOPO i comandi
+    # email/posta sopra, cosi' una frase come "manda una mail dicendo che ho
+    # fatto la spesa" resta instradata sull'email (priorita' piu' specifica)
+    # invece di finire per sbaglio qui solo perche' contiene la parola
+    # "spesa". Richiede comunque sempre "spesa" nella frase, per non
+    # intercettare conversazioni normali (es. "ho comprato una macchina
+    # nuova" non deve mai finire qui).
+    if "spesa" in t:
+        return "lista_spesa"
     if any(k in t for k in ["calendario", "impegni", "agenda", "appuntamenti"]):
         return "calendario"
     return None
@@ -1431,6 +1626,28 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
             _titolo = ev.get("summary", "(senza titolo)")
             righe.append(f"- {_inizio}: {_titolo}")
         return "Ecco i prossimi impegni nel calendario:\n" + "\n".join(righe) + _nota_fonte
+
+    if comando == "lista_spesa":
+        _t = (testo_completo or "").lower()
+        if any(k in _t for k in ["mostra", "vedi", "che c'e' nella", "che c'è nella", "cosa devo comprare", "cosa manca", "fammi vedere", "fai vedere"]):
+            _azione = "mostra"
+        elif any(k in _t for k in ["ho comprato", "ho preso", "segna come compr", "gia' compr", "già compr", "ho gia' preso", "ho già preso"]):
+            _azione = "comprato"
+        elif any(k in _t for k in ["aggiung", "metti", "servono", "serve ", "compra "]):
+            _azione = "aggiungi"
+        else:
+            # Frase con "spesa" ma senza un verbo riconosciuto (es. solo
+            # "lista della spesa"): mostra la lista invece di non fare nulla,
+            # e' l'interpretazione piu' utile in assenza di indicazioni.
+            _azione = "mostra"
+
+        _articoli = []
+        if _azione in ("aggiungi", "comprato"):
+            _parole_trigger = ["aggiungi", "aggiungimi", "aggiungere", "metti", "servono", "serve ", "compra "] if _azione == "aggiungi" else ["ho comprato", "ho preso", "ho gia' preso", "ho già preso"]
+            _articoli = _estrai_articoli_spesa(testo_completo, _parole_trigger)
+
+        _risultato = _gestisci_lista_spesa(creds, _azione, _articoli, utente.get("name"))
+        return (_risultato or "Non sono riuscito a completare l'operazione sulla lista della spesa.") + _nota_fonte
 
     if comando == "leggi_posta":
         emails = _list_recent_emails(creds, limit=5)
