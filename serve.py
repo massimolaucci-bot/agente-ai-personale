@@ -71,6 +71,7 @@ GOOGLE_OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/documents",
 ]
 OAUTH_STATE_TTL_SECONDI = 600  # 10 minuti: tempo massimo per completare il consenso su Google
 

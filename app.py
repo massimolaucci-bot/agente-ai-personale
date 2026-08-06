@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import base64
 import hashlib
@@ -18,6 +19,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build as google_build
 from googleapiclient.errors import HttpError as GoogleHttpError
+from googleapiclient.http import MediaIoBaseUpload
 
 MEMORY_FILE = "chat_memory.json"
 KNOWLEDGE_FILE = "knowledge.json"
@@ -67,6 +69,7 @@ GOOGLE_OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/documents",
 ]
 
 # access_token/refresh_token sono piu' sensibili dei PIN/token "ricordami"
@@ -1409,20 +1412,332 @@ def _gestisci_lista_spesa(creds, azione, articoli, nome_utente):
         return "Non sono riuscito ad accedere alla lista della spesa in questo momento."
 
 
-def _connessione_ha_scope_sheets(tokens):
-    # Un account collegato PRIMA del round 13 non ha mai concesso il
-    # permesso sui Fogli Google (scope aggiunto solo ora): senza questo
+# --- Verbali audio: un messaggio vocale che inizia con "verbale" (stessa
+# convenzione gia' in uso per "addestramento") viene trascritto, riassunto
+# dall'IA in un verbale ordinato, salvato come Google Doc, mentre l'audio
+# originale finisce su Google Drive con un promemoria a 10 giorni per
+# decidere se tenerlo o cancellarlo (il verbale scritto resta comunque per
+# sempre). Richiede il nuovo permesso "documents", oltre a quelli gia' in
+# uso per Calendar/Gmail/Sheets/Drive.
+_NOME_CARTELLA_AUDIO_VERBALI = "Registrazioni Verbali"
+_NOME_CARTELLA_DOC_VERBALI = "Verbali Scritti"
+_GIORNI_SCADENZA_VERBALE = 10
+
+
+def _testo_comando_verbale_nuovo(testo):
+    """True se il messaggio (di solito la trascrizione di un vocale) inizia
+    con la parola "verbale": attiva la creazione di un nuovo verbale invece
+    del normale flusso di chat. Il chiamante deve comunque controllare che ci
+    sia davvero un audio allegato, altrimenti non c'e' nulla da trascrivere/
+    archiviare. Esclude le frasi che parlano di scadenze (es. "verbale in
+    scadenza"), gestite altrove come domanda sui verbali gia' esistenti, non
+    come richiesta di crearne uno nuovo."""
+    if not testo:
+        return False
+    _t = testo.strip().lower()
+    if not _t.startswith("verbale"):
+        return False
+    if "scadenz" in _t:
+        return False
+    return True
+
+
+def _trova_o_crea_cartella_drive(creds, nome):
+    drive_service = google_build("drive", "v3", credentials=creds)
+    risultati = drive_service.files().list(
+        q=f"name='{nome}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id, name)",
+    ).execute()
+    trovati = risultati.get("files", [])
+    if trovati:
+        return trovati[0]["id"]
+    cartella = drive_service.files().create(
+        body={"name": nome, "mimeType": "application/vnd.google-apps.folder"}, fields="id",
+    ).execute()
+    return cartella["id"]
+
+
+def _riassumi_verbale_con_ia(trascrizione):
+    # Stesso schema gia' in uso per le bozze di risposta email (round 12):
+    # client Groq locale dedicato, non quello globale della chat principale,
+    # e stesso modello di riserva (FALLBACK_MODEL) per coerenza col resto
+    # del progetto.
+    try:
+        _prompt = (
+            "Sei un segretario che scrive verbali. Trasforma questa trascrizione grezza "
+            "di una registrazione vocale in un verbale ordinato in italiano, con questa struttura:\n"
+            "TITOLO: (breve, basato sul contenuto)\n"
+            "PARTECIPANTI: (se menzionati, altrimenti \"non specificati\")\n"
+            "PUNTI PRINCIPALI: (elenco puntato)\n"
+            "DECISIONI PRESE: (elenco puntato, oppure \"nessuna\" se non ce ne sono)\n"
+            "COSE DA FARE: (elenco puntato, con chi se menzionato, oppure \"nessuna\")\n\n"
+            f"Trascrizione:\n{trascrizione}"
+        )
+        _groq_api_key_locale = os.environ.get("GROQ_API_KEY")
+        _client_verbale = Groq(api_key=_groq_api_key_locale)
+        _completamento = _client_verbale.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=[{"role": "user", "content": _prompt}],
+            max_tokens=1200,
+        )
+        return _completamento.choices[0].message.content
+    except Exception as e:
+        print(f"[verbali] riassunto IA fallito: {e}", flush=True)
+        return None
+
+
+def _crea_documento_verbale(creds, testo, titolo, cartella_id):
+    try:
+        drive_service = google_build("drive", "v3", credentials=creds)
+        _doc = drive_service.files().create(
+            body={
+                "name": f"Verbale - {titolo}",
+                "mimeType": "application/vnd.google-apps.document",
+                "parents": [cartella_id],
+            },
+            fields="id",
+        ).execute()
+        doc_id = _doc["id"]
+        docs_service = google_build("docs", "v1", credentials=creds)
+        docs_service.documents().batchUpdate(
+            documentId=doc_id,
+            body={"requests": [{"insertText": {"location": {"index": 1}, "text": testo}}]},
+        ).execute()
+        return doc_id
+    except Exception as e:
+        print(f"[verbali] creazione documento fallita: {e}", flush=True)
+        return None
+
+
+def _crea_promemoria_scadenza_verbale(creds, nome_file, scadenza_dt):
+    try:
+        calendar_service = google_build("calendar", "v3", credentials=creds)
+        evento = {
+            "summary": f"🗑️ Decidi: tenere o cancellare l'audio \"{nome_file}\"?",
+            "description": (
+                f"Sono passati {_GIORNI_SCADENZA_VERBALE} giorni dalla registrazione \"{nome_file}\". "
+                f"In chat con Carpanet AI scrivi \"tieni {nome_file}\" per conservarla, oppure "
+                f"\"cancella {nome_file}\" per eliminarla (il verbale scritto resta comunque salvato)."
+            ),
+            "start": {"date": scadenza_dt.strftime("%Y-%m-%d")},
+            "end": {"date": (scadenza_dt + timedelta(days=1)).strftime("%Y-%m-%d")},
+            "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 1440}]},
+        }
+        return calendar_service.events().insert(calendarId="primary", body=evento).execute().get("id")
+    except Exception as e:
+        print(f"[verbali] creazione promemoria fallita: {e}", flush=True)
+        return None
+
+
+def _elimina_evento_calendario(creds, event_id):
+    if not event_id:
+        return
+    try:
+        google_build("calendar", "v3", credentials=creds).events().delete(calendarId="primary", eventId=event_id).execute()
+    except Exception:
+        pass  # evento gia' cancellato/non trovato: non e' un errore da bloccare
+
+
+def _salva_verbale_db(user_id, file_id_drive, file_name, doc_id_drive, scadenza_dt, calendar_event_id):
+    if not _supabase_enabled():
+        return False
+    try:
+        payload = {
+            "user_id": user_id,
+            "file_id_drive": file_id_drive,
+            "file_name": file_name,
+            "doc_id_drive": doc_id_drive,
+            "status": "pending",
+            "deadline_at": scadenza_dt.isoformat(),
+            "calendar_event_id": calendar_event_id,
+        }
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/audio_transcriptions",
+            headers=SUPABASE_HEADERS, json=payload, timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[verbali] salvataggio su Supabase fallito: {e}", flush=True)
+        return False
+
+
+def _trova_verbale_pendente_db(user_id, nome_parziale):
+    if not _supabase_enabled():
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/audio_transcriptions",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "*",
+                "user_id": f"eq.{user_id}",
+                "status": "eq.pending",
+                "file_name": f"ilike.*{nome_parziale}*",
+                "order": "deadline_at.asc",
+                "limit": 1,
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        righe = r.json()
+        return righe[0] if righe else None
+    except Exception as e:
+        print(f"[verbali] ricerca verbale pendente fallita: {e}", flush=True)
+        return None
+
+
+def _elenca_verbali_in_scadenza_db(user_id, giorni=3):
+    if not _supabase_enabled():
+        return []
+    try:
+        _soglia = (datetime.now(timezone.utc) + timedelta(days=giorni)).isoformat()
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/audio_transcriptions",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "*",
+                "user_id": f"eq.{user_id}",
+                "status": "eq.pending",
+                "deadline_at": f"lte.{_soglia}",
+                "order": "deadline_at.asc",
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[verbali] elenco scadenze fallito: {e}", flush=True)
+        return []
+
+
+def _aggiorna_stato_verbale_db(record_id, nuovo_stato):
+    if not _supabase_enabled():
+        return False
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/audio_transcriptions",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{record_id}"},
+            json={"status": nuovo_stato},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[verbali] aggiornamento stato fallito: {e}", flush=True)
+        return False
+
+
+def _crea_verbale_da_audio(creds, audio_bytes, trascrizione, utente):
+    try:
+        _adesso = datetime.now(ZoneInfo("Europe/Rome"))
+        _etichetta = _adesso.strftime("%d-%m-%Y %H%M")
+        nome_file = f"{_etichetta}.wav"
+
+        cartella_audio_id = _trova_o_crea_cartella_drive(creds, _NOME_CARTELLA_AUDIO_VERBALI)
+        cartella_doc_id = _trova_o_crea_cartella_drive(creds, _NOME_CARTELLA_DOC_VERBALI)
+
+        drive_service = google_build("drive", "v3", credentials=creds)
+        # L'audio registrato dal microfono di questa app e' sempre WAV (vedi
+        # piu' sotto nel loop della chat, stesso formato gia' usato per la
+        # trascrizione Whisper) — mai un mp3 inventato.
+        media = MediaIoBaseUpload(io.BytesIO(audio_bytes), mimetype="audio/wav", resumable=False)
+        audio_file = drive_service.files().create(
+            body={"name": nome_file, "parents": [cartella_audio_id]}, media_body=media, fields="id",
+        ).execute()
+        audio_id = audio_file["id"]
+
+        verbale_testo = _riassumi_verbale_con_ia(trascrizione) or f"Trascrizione grezza (riassunto automatico non riuscito):\n\n{trascrizione}"
+        doc_id = _crea_documento_verbale(creds, verbale_testo, _etichetta, cartella_doc_id)
+        if not doc_id:
+            return "Ho salvato l'audio su Drive ma non sono riuscito a creare il documento del verbale. Riprova tra poco."
+
+        _scadenza = _adesso + timedelta(days=_GIORNI_SCADENZA_VERBALE)
+        evento_id = _crea_promemoria_scadenza_verbale(creds, nome_file, _scadenza)
+        _salva_verbale_db(utente.get("id"), audio_id, nome_file, doc_id, _scadenza, evento_id)
+
+        return (
+            "✅ Verbale creato e salvato.\n"
+            f"- Audio originale su Google Drive (cartella \"{_NOME_CARTELLA_AUDIO_VERBALI}\").\n"
+            f"- Verbale scritto: https://docs.google.com/document/d/{doc_id}\n"
+            f"- Tra {_GIORNI_SCADENZA_VERBALE} giorni ({_scadenza.strftime('%d/%m/%Y')}) ti ricordero' di decidere se "
+            "tenere o cancellare l'audio originale (il verbale scritto resta comunque per sempre)."
+        )
+    except Exception as e:
+        print(f"[verbali] creazione verbale fallita: {e}", flush=True)
+        return "Non sono riuscito a creare il verbale in questo momento. Riprova tra poco."
+
+
+def _gestisci_nuovo_verbale(utente, audio_bytes, trascrizione):
+    if not _google_oauth_enabled():
+        return "La connessione con Google non e' ancora configurata su questo server."
+    if not trascrizione:
+        return "Non sono riuscito a trascrivere l'audio: riprova a registrare di nuovo il verbale."
+    conn_type, conn_user_id = _scegli_connessione_google(utente, "verbale")
+    if not conn_type:
+        return (
+            "Non risulta ancora nessun account Google collegato (ne' il tuo personale ne' quello di famiglia): "
+            "collegalo dalla barra laterale, sezione \"Collegamenti Google\", per poter salvare i verbali."
+        )
+    creds = _get_google_credentials(conn_type, conn_user_id)
+    if not creds:
+        return "Non riesco ad accedere al tuo account Google in questo momento: prova a ricollegarlo dalla barra laterale."
+    return _crea_verbale_da_audio(creds, audio_bytes, trascrizione, utente)
+
+
+def _gestisci_verbali_scadenza(utente):
+    _righe = _elenca_verbali_in_scadenza_db(utente.get("id"), giorni=3)
+    if not _righe:
+        return "Non ci sono verbali audio in scadenza nei prossimi giorni."
+    _elenco = "\n".join(f"- \"{r['file_name']}\" (scade il {str(r['deadline_at'])[:10]})" for r in _righe)
+    return (
+        "📅 Verbali audio in scadenza:\n" + _elenco +
+        "\n\nRispondi \"tieni [nome]\" per conservarli oppure \"cancella [nome]\" per eliminare l'audio "
+        "(il verbale scritto resta comunque salvato)."
+    )
+
+
+def _gestisci_decisione_verbale(creds, azione, nome_parziale, utente):
+    if not nome_parziale:
+        return "Dimmi anche il nome del verbale, ad esempio \"tieni 05-08-2026 1830\"."
+    record = _trova_verbale_pendente_db(utente.get("id"), nome_parziale)
+    if not record:
+        return f"Non trovo nessun verbale in attesa di decisione con nome simile a \"{nome_parziale}\"."
+
+    if azione == "tieni":
+        _elimina_evento_calendario(creds, record.get("calendar_event_id"))
+        _aggiorna_stato_verbale_db(record["id"], "kept")
+        return f"✅ Audio \"{record['file_name']}\" conservato. Promemoria rimosso dal calendario."
+
+    try:
+        google_build("drive", "v3", credentials=creds).files().delete(fileId=record["file_id_drive"]).execute()
+    except Exception as e:
+        print(f"[verbali] cancellazione audio da Drive fallita: {e}", flush=True)
+    _elimina_evento_calendario(creds, record.get("calendar_event_id"))
+    _aggiorna_stato_verbale_db(record["id"], "deleted")
+    return f"🗑️ Audio \"{record['file_name']}\" eliminato da Drive. Il verbale scritto resta salvato."
+
+
+def _permessi_google_mancanti(tokens):
+    # Un account collegato PRIMA che un permesso venisse aggiunto non lo ha
+    # mai concesso (Google non lo fa retroattivamente): senza questo
     # controllo l'utente scoprirebbe il problema solo al primo tentativo
-    # fallito di usare la lista della spesa, con un errore poco chiaro.
+    # fallito di usare la funzione, con un errore poco chiaro.
     if not tokens:
-        return True  # non ancora collegato: nessun avviso di "manca il permesso", solo "collega"
+        return []  # non ancora collegato: nessun avviso di "permesso mancante", solo "collega"
     _scope = (tokens.get("scope") or "")
-    return "spreadsheets" in _scope
+    _mancanti = []
+    if "spreadsheets" not in _scope:
+        _mancanti.append("Fogli Google (lista della spesa)")
+    if "documents" not in _scope:
+        _mancanti.append("Documenti Google (verbali)")
+    return _mancanti
 
 
 def _render_google_connection_ui():
     st.markdown("---")
-    st.markdown("#### 📅 Collegamenti Google (Calendario, Gmail e Fogli)")
+    st.markdown("#### 📅 Collegamenti Google (Calendario, Gmail, Fogli e Documenti)")
     if not _google_oauth_enabled():
         st.caption("Funzione non ancora attiva: mancano le credenziali Google sul server.")
         return
@@ -1436,8 +1751,9 @@ def _render_google_connection_ui():
         _shared = _fetch_google_tokens("shared")
         if _shared:
             st.success("Account condiviso collegato.")
-            if not _connessione_ha_scope_sheets(_shared):
-                st.warning("Collegato prima dell'aggiunta della lista della spesa: ricollega per usare anche i Fogli Google.")
+            _mancanti_shared = _permessi_google_mancanti(_shared)
+            if _mancanti_shared:
+                st.warning("Collegato prima di aggiungere questi permessi: ricollega per usare anche " + " e ".join(_mancanti_shared) + ".")
             if st.button("Disconnetti account condiviso", key="disconnetti_google_shared"):
                 _delete_google_tokens("shared")
                 st.rerun()
@@ -1447,12 +1763,13 @@ def _render_google_connection_ui():
         st.markdown("---")
 
     st.caption(f"Il tuo account Google personale ({_utente_corrente.get('name', 'Utente')}): usato di default per le tue richieste "
-               "(es. \"che email ho?\", \"che impegni ho oggi?\", \"lista della spesa\"). Puoi averlo collegato insieme a quello di famiglia qui sopra.")
+               "(es. \"che email ho?\", \"che impegni ho oggi?\", \"lista della spesa\", \"verbale...\" con un vocale). Puoi averlo collegato insieme a quello di famiglia qui sopra.")
     _personal = _fetch_google_tokens("personal", _utente_corrente.get("id"))
     if _personal:
         st.success("Il tuo account personale e' collegato.")
-        if not _connessione_ha_scope_sheets(_personal):
-            st.warning("Collegato prima dell'aggiunta della lista della spesa: ricollega per usare anche i Fogli Google.")
+        _mancanti_personal = _permessi_google_mancanti(_personal)
+        if _mancanti_personal:
+            st.warning("Collegato prima di aggiungere questi permessi: ricollega per usare anche " + " e ".join(_mancanti_personal) + ".")
         if st.button("Disconnetti il mio account", key="disconnetti_google_personal"):
             _delete_google_tokens("personal", _utente_corrente.get("id"))
             st.rerun()
@@ -1467,6 +1784,16 @@ def _testo_comando_google(testo):
     # positivi su frasi generiche che contengono le stesse parole, accettato
     # come limite noto per la semplicita' dell'implementazione.
     t = (testo or "").lower()
+    # Decisione su un verbale audio in scadenza ("tieni ..."/"cancella ...",
+    # come indicato nel promemoria di Calendar): controllati per primi,
+    # perche' sono verbi imperativi molto specifici solo se all'inizio del
+    # messaggio (mai una parola generica di una domanda diversa).
+    if t.startswith("tieni "):
+        return "verbale_tieni"
+    if t.startswith("cancella "):
+        return "verbale_cancella"
+    if any(k in t for k in ["verbali in scadenza", "verbale in scadenza", "scadenze verbali", "mostra le scadenze", "mostra scadenze", "verbali da decidere"]):
+        return "verbale_scadenze"
     if any(k in t for k in ["rispondi a", "rispondi all'ultima", "prepara una bozza", "scrivi una bozza", "fammi una bozza", "scrivi una risposta"]):
         return "bozza_risposta"
     # Comando distinto da "rispondi a" sopra: qui l'utente vuole scrivere
@@ -1613,6 +1940,21 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
     _nota_fonte = ""
     if _entrambi_collegati:
         _nota_fonte = "\n\n_(account di famiglia)_" if conn_type == "shared" else "\n\n_(il tuo account personale — per la famiglia, chiedi es. \"calendario di famiglia\")_"
+
+    if comando == "verbale_scadenze":
+        return _gestisci_verbali_scadenza(utente) + _nota_fonte
+
+    if comando == "verbale_tieni":
+        _nome = testo_completo.strip()
+        if _nome.lower().startswith("tieni"):
+            _nome = _nome[len("tieni"):].strip(" :")
+        return _gestisci_decisione_verbale(creds, "tieni", _nome, utente)
+
+    if comando == "verbale_cancella":
+        _nome = testo_completo.strip()
+        if _nome.lower().startswith("cancella"):
+            _nome = _nome[len("cancella"):].strip(" :")
+        return _gestisci_decisione_verbale(creds, "cancella", _nome, utente)
 
     if comando == "calendario":
         eventi = _list_calendar_events(creds, max_results=10)
@@ -2927,10 +3269,15 @@ else:
         _file_allegati = user_input.files or []
         _resto_addestramento = _testo_comando_addestramento(testo_completo)
         _comando_addestramento_attivo = _resto_addestramento is not None
-        # Il comando Google (calendario/posta) e' controllato solo se non e'
-        # gia' attivo il comando di addestramento, per evitare ambiguita' tra
-        # i due (l'addestramento ha sempre la precedenza).
-        _comando_google = None if _comando_addestramento_attivo else _testo_comando_google(testo_completo)
+        # Creazione di un nuovo verbale audio: come l'addestramento, ha
+        # sempre precedenza sul normale comando Google (calendario/posta/
+        # lista spesa), perche' richiede l'audio grezzo appena registrato,
+        # non solo il testo trascritto.
+        _comando_verbale_nuovo_attivo = (not _comando_addestramento_attivo) and _testo_comando_verbale_nuovo(testo_completo)
+        # Il comando Google (calendario/posta/lista spesa/verbali) e'
+        # controllato solo se non sono gia' attivi i due comandi sopra, per
+        # evitare ambiguita' tra loro.
+        _comando_google = None if (_comando_addestramento_attivo or _comando_verbale_nuovo_attivo) else _testo_comando_google(testo_completo)
 
         if _comando_addestramento_attivo:
             # Il comando "addestramento" salva testo/file nella memoria
@@ -2944,6 +3291,21 @@ else:
                 st.session_state.current_user.get("name", "Utente"),
                 IS_PARENT,
             )
+        elif _comando_verbale_nuovo_attivo:
+            # Il comando "verbale" (stesso schema di "addestramento": parola
+            # all'inizio del messaggio) trascrive, riassume e salva un nuovo
+            # verbale audio, invece di essere mandato all'AI come domanda
+            # normale. Richiede un vocale registrato nello stesso messaggio.
+            prompt = testo_completo if testo_completo else "verbale"
+            if user_input.audio is None:
+                risposta_verbale_nuovo = (
+                    "Per creare un verbale registra un messaggio vocale che inizi con \"verbale\": "
+                    "lo trascrivo, salvo l'audio su Google Drive e creo il documento del verbale scritto."
+                )
+            else:
+                risposta_verbale_nuovo = _gestisci_nuovo_verbale(
+                    st.session_state.current_user, user_input.audio.getvalue(), trascrizione_audio,
+                )
         else:
             notes = []
             if _audio_non_trascritto:
@@ -2964,6 +3326,7 @@ else:
         prompt = None
         _input_era_vocale = False
         _comando_addestramento_attivo = False
+        _comando_verbale_nuovo_attivo = False
         _comando_google = None
 
     # Ora che sappiamo se in questo giro arriva anche una risposta nuova,
@@ -3013,6 +3376,11 @@ else:
                 # direttamente la conferma (o il messaggio d'errore) gia'
                 # preparata sopra durante la gestione dell'allegato/testo.
                 response = risposta_addestramento
+            elif _comando_verbale_nuovo_attivo:
+                # Comando "verbale": stesso schema, la risposta e' gia' stata
+                # preparata sopra (creazione vera del verbale, o richiesta di
+                # registrare un vocale se non ne era presente uno).
+                response = risposta_verbale_nuovo
             elif _comando_google:
                 # Comando Google (calendario/posta): niente chiamata al
                 # modello Groq per la risposta principale, si usa Calendar/
