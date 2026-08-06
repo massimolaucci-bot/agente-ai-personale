@@ -21,15 +21,25 @@ test_dispatch_google_unit.py), solo applicato al codice di produzione invece
 che ai test.
 
 Copertura in questo round (deliberatamente NON tutto quello che sa fare la
-chat principale): calendario (lettura + creazione promemoria/eventi) e lista
-della spesa (aggiungi/mostra/segna comprato). Email e verbali audio restano
-disponibili solo dall'app web per ora: userebbero ulteriore codice non
-ancora duplicato qui, e allargare la superficie senza poterla verificare con
-un bot reale (serve un token da @BotFather che non e' ancora disponibile)
-avrebbe significato consegnare codice non testato. Qualunque messaggio che
-non riguarda calendario/lista della spesa passa comunque alla chat generica
-(stesso modello Groq della chat principale), quindi il bot resta utile da
-subito anche per conversazione libera.
+chat principale): calendario (lettura + creazione promemoria/eventi), lista
+della spesa (aggiungi/mostra/segna comprato) e il morning briefing su
+richiesta (vedi sotto). Email e verbali audio restano disponibili solo
+dall'app web per ora: userebbero ulteriore codice non ancora duplicato qui,
+e allargare la superficie senza poterla verificare con un bot reale (serve
+un token da @BotFather che non e' ancora disponibile) avrebbe significato
+consegnare codice non testato. Qualunque messaggio che non riguarda queste
+azioni passa comunque alla chat generica (stesso modello Groq della chat
+principale), quindi il bot resta utile da subito anche per conversazione
+libera.
+
+MORNING BRIEFING: SOLO SU RICHIESTA, NON AUTOMATICO (decisione esplicita).
+genera_morning_briefing() esiste come funzione condivisa ed e' raggiungibile
+in due modi: (1) su richiesta dell'utente via chat/vocale Telegram
+(azione "richiedi_briefing_mattutino", gestita sotto - nessun trigger
+schedulato necessario), e (2) dalla rotta /cron/morning-briefing in
+serve.py, tenuta com'e' ma NON collegata a nessuno scheduler per scelta
+dell'utente: ha preferito poter chiedere il riepilogo quando vuole invece di
+riceverlo automaticamente ogni mattina a un orario fisso.
 """
 import os
 import re
@@ -471,6 +481,11 @@ TELEGRAM_TOOLS_SCHEMA = [
             "articoli": {"type": "array", "items": {"type": "string"}, "description": "Elenco degli articoli gia' comprati."},
         }, "required": ["articoli"]},
     }},
+    {"type": "function", "function": {
+        "name": "richiedi_briefing_mattutino",
+        "description": "Genera su richiesta il riepilogo/briefing degli impegni di oggi. Usa questo per richieste come 'dammi il riepilogo di oggi', 'cosa ho oggi', 'fammi il briefing del mattino', 'riassumimi la giornata', 'che impegni ho oggi'. Non richiede parametri.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
 ]
 
 
@@ -571,6 +586,12 @@ def _handle_google_agent_logic_telegram(azione_nome, argomenti, utente, testo_co
             return "Non ho capito quali articoli segnare come comprati: puoi ripetermeli?"
         return _gestisci_lista_spesa(creds, "comprato", _articoli, utente.get("name")) or "Non sono riuscito a completare l'operazione."
 
+    if azione_nome == "richiedi_briefing_mattutino":
+        _briefing = genera_morning_briefing(utente)
+        if not _briefing:
+            return "Non sono riuscito a generare il riepilogo di oggi: controlla che il tuo account Google sia collegato."
+        return _briefing
+
     return "Non so ancora fare questa azione da Telegram: prova dall'app web."
 
 
@@ -591,9 +612,9 @@ def elabora_messaggio_telegram(testo_completo, utente):
             messages=[
                 {"role": "system", "content": (
                     "Sei Carpanet AI, assistente di famiglia, qui via Telegram. Rispondi in italiano, breve e "
-                    "diretto. Non inventare mai azioni che non sai fare davvero (calendario e lista della spesa "
-                    "sono le uniche azioni reali disponibili da qui; per email e verbali audio indirizza "
-                    "l'utente all'app web)."
+                    "diretto. Non inventare mai azioni che non sai fare davvero (calendario, lista della spesa e "
+                    "il riepilogo/briefing del mattino su richiesta sono le uniche azioni reali disponibili da "
+                    "qui; per email e verbali audio indirizza l'utente all'app web)."
                 )},
                 {"role": "user", "content": testo_completo},
             ],
