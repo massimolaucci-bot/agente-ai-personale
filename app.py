@@ -1779,69 +1779,204 @@ def _render_google_connection_ui():
         st.caption("L'accesso a Gmail va ricollegato circa ogni 7 giorni (limite dell'app Google in modalita' di test): basta ricliccare il collegamento quando serve.")
 
 
-def _testo_comando_google(testo):
-    # Rilevamento a parole chiave (non un vero NLU): puo' avere falsi
-    # positivi su frasi generiche che contengono le stesse parole, accettato
-    # come limite noto per la semplicita' dell'implementazione.
-    t = (testo or "").lower()
-    # Decisione su un verbale audio in scadenza ("tieni ..."/"cancella ...",
-    # come indicato nel promemoria di Calendar): controllati per primi,
-    # perche' sono verbi imperativi molto specifici solo se all'inizio del
-    # messaggio (mai una parola generica di una domanda diversa).
-    if t.startswith("tieni "):
-        return "verbale_tieni"
-    if t.startswith("cancella "):
-        return "verbale_cancella"
-    if any(k in t for k in ["verbali in scadenza", "verbale in scadenza", "scadenze verbali", "mostra le scadenze", "mostra scadenze", "verbali da decidere"]):
-        return "verbale_scadenze"
-    if any(k in t for k in ["rispondi a", "rispondi all'ultima", "prepara una bozza", "scrivi una bozza", "fammi una bozza", "scrivi una risposta"]):
-        return "bozza_risposta"
-    # Comando distinto da "rispondi a" sopra: qui l'utente vuole scrivere
-    # un'email NUOVA a qualcuno (non una risposta a un'email ricevuta). Prima
-    # di questo fix non esisteva affatto: una richiesta del genere cadeva nel
-    # normale flusso di chat con Groq, che rispondeva a parole di non poter
-    # inviare email (bug segnalato dall'utente).
-    _verbo_di_invio = any(k in t for k in ["manda", "invia", "spedisci", "componi", "scriv"])
-    _parla_di_nuova_email = any(k in t for k in ["email", "e-mail", "mail", "posta"])
-    if _verbo_di_invio and _parla_di_nuova_email:
-        return "nuova_email"
-    if any(k in t for k in ["leggimi la posta", "leggi la posta", "leggimi le mail", "leggimi le email", "ultime email", "ultime mail", "posta in arrivo", "che email ho"]):
-        return "leggi_posta"
-    # Riconoscimento piu' ampio: qualunque frase che nomini la posta/email E
-    # contenga un verbo/azione di lettura, anche se non corrisponde a una
-    # delle frasi esatte sopra (es. "mi puoi leggere l'ultima email che e'
-    # arrivata?", che non conteneva nessuna delle frasi letterali attese).
-    _parla_di_posta = any(k in t for k in ["email", "e-mail", "mail", "posta"])
-    _verbo_di_lettura = any(k in t for k in [
-        "leggi", "legger", "mostra", "controlla", "controllami",
-        "hai ricevuto", "che novita", "novita'", "novità", "che c'e' di nuovo",
-    ])
-    if _parla_di_posta and _verbo_di_lettura:
-        return "leggi_posta"
-    # Lista della spesa (Google Sheets): controllata DOPO i comandi
-    # email/posta sopra, cosi' una frase come "manda una mail dicendo che ho
-    # fatto la spesa" resta instradata sull'email (priorita' piu' specifica)
-    # invece di finire per sbaglio qui solo perche' contiene la parola
-    # "spesa". Richiede comunque sempre "spesa" nella frase, per non
-    # intercettare conversazioni normali (es. "ho comprato una macchina
-    # nuova" non deve mai finire qui).
-    if "spesa" in t:
-        return "lista_spesa"
-    if any(k in t for k in ["calendario", "impegni", "agenda", "appuntamenti"]):
-        return "calendario"
-    return None
+# Elenco dei "tool" (azioni reali) che il modello puo' attivare capendo il
+# significato del messaggio, invece del vecchio riconoscimento a parole
+# chiave fisse (_testo_comando_google, rimosso in questo round: obbligava a
+# ricordare frasi quasi esatte, poco praticabile per un uso di famiglia).
+# Deliberatamente NON include azioni che non sono ancora state costruite per
+# davvero (es. domotica): un tool nello schema comunica al modello "questa e'
+# una cosa che l'app sa fare", quindi elencarne una finta rischierebbe di
+# reintrodurre lo stesso problema dell'invenzione di azioni mai avvenute
+# (vedi la regola ferrea in build_api_messages). Quando una nuova azione
+# reale verra' costruita, si aggiungera' qui insieme alla funzione vera che
+# la esegue - mai prima.
+GOOGLE_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "leggi_calendario",
+            "description": "Legge i prossimi impegni dal calendario (personale o di famiglia). Non richiede parametri.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "leggi_posta",
+            "description": "Legge le ultime email ricevute. Non richiede parametri.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rispondi_ultima_email",
+            "description": "Prepara una bozza di risposta all'ultima email ricevuta (mai inviata subito, resta bozza da confermare). Richiede indicazioni su cosa scrivere.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "indicazioni": {"type": "string", "description": "Cosa deve dire la risposta (es. 'digli che arrivo tardi', 'ringrazia per l'invito')."},
+                },
+                "required": ["indicazioni"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scrivi_nuova_email",
+            "description": "Crea una bozza di email nuova (mai inviata subito, resta bozza da confermare). Richiede l'indirizzo email esatto del destinatario, che deve comparire nel messaggio dell'utente: non va mai inventato.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "destinatario": {"type": "string", "description": "Indirizzo email esatto del destinatario (es. mario@rossi.it). Deve essere presente nel messaggio dell'utente, mai inventato."},
+                    "indicazioni": {"type": "string", "description": "Cosa deve contenere l'email."},
+                },
+                "required": ["destinatario", "indicazioni"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lista_spesa_aggiungi",
+            "description": "Aggiunge articoli alla lista della spesa di famiglia su Google Sheets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "articoli": {"type": "array", "items": {"type": "string"}, "description": "Elenco degli articoli da aggiungere (es. ['latte', 'pane'])."},
+                },
+                "required": ["articoli"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lista_spesa_mostra",
+            "description": "Mostra la lista della spesa attuale (solo gli articoli ancora da comprare).",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lista_spesa_segna_comprato",
+            "description": "Segna come gia' comprati gli articoli indicati, senza cancellarli dallo storico.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "articoli": {"type": "array", "items": {"type": "string"}, "description": "Elenco degli articoli gia' comprati."},
+                },
+                "required": ["articoli"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verbali_mostra_scadenza",
+            "description": "Mostra l'elenco dei verbali audio in attesa di decisione (tenere o cancellare), secondo la regola dei 10 giorni.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verbale_decidi",
+            "description": "Decide cosa fare di un verbale audio in attesa: conservarlo o cancellarlo (elimina l'audio da Drive, il documento scritto del verbale resta comunque salvato).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "azione": {"type": "string", "enum": ["tieni", "cancella"], "description": "'tieni' per conservare l'audio, 'cancella' per eliminarlo."},
+                    "nome_file": {"type": "string", "description": "Nome (anche parziale) del file audio o del verbale a cui si riferisce l'utente."},
+                },
+                "required": ["azione", "nome_file"],
+            },
+        },
+    },
+]
 
 
+def _classifica_intento_google(testo_completo, cronologia_recente, utente):
+    """Capisce se il messaggio corrente vuole attivare una delle azioni reali
+    sopra, usando il function calling di Groq invece del vecchio
+    riconoscimento a parole chiave fisse: cosi' non serve piu' ricordare
+    frasi quasi esatte, e frasi dette in modi diversi vengono riconosciute lo
+    stesso. Se manca un dettaglio necessario (es. quale indirizzo email,
+    quale articolo, quale verbale), il modello fa una domanda di chiarimento
+    invece di indovinare - e non deve MAI inventare un dato mancante.
+    Ritorna una tupla (tipo, valore):
+    - ("AZIONE", {"name": ..., "arguments": {...}}) - pronta all'esecuzione;
+    - ("DOMANDA", "testo della domanda") - serve un chiarimento;
+    - ("NESSUNA", None) - non riguarda queste azioni, o Google non e'
+      configurato, o la chiamata a Groq e' fallita: in ogni caso il chiamante
+      deve lasciar fluire il messaggio alla chat generica come se questo
+      controllo non fosse mai avvenuto.
+    Usa FALLBACK_MODEL (llama-3.3-70b-versatile), modello Groq con supporto
+    affidabile per i tool personalizzati - non PRIMARY_MODEL ("groq/compound"),
+    il cui comportamento con "tools" definiti da noi non e' documentato."""
+    if not _google_oauth_enabled():
+        return ("NESSUNA", None)
+
+    system_prompt = (
+        "Sei il modulo di riconoscimento intenti di Carpanet AI, assistente di famiglia. Il tuo unico compito e' "
+        "decidere se il messaggio dell'utente vuole attivare una delle azioni disponibili (tools) - non devi "
+        "rispondere nel merito, ne' conversare.\n\n"
+        "REGOLE FERREE:\n"
+        "1. Se il messaggio corrisponde chiaramente a un'azione E hai tutti i parametri richiesti (es. indirizzo "
+        "email esplicito, articoli specifici, nome del verbale), chiama il tool corrispondente con quegli argomenti.\n"
+        "2. Se sembra riguardare una di queste azioni ma mancano dettagli necessari (es. 'manda una email' senza "
+        "destinatario, 'cancella l'audio' senza dire quale), NON chiamare nessun tool: rispondi invece con una "
+        "domanda di chiarimento breve e diretta in italiano, cosi' l'utente puo' risponderti con il dettaglio mancante.\n"
+        "3. Se il messaggio non riguarda nessuna di queste azioni (conversazione generica, domande su altri "
+        "argomenti, richieste che l'app non sa fare come creare presentazioni o altri file), NON chiamare nessun "
+        "tool e rispondi ESATTAMENTE con il testo NESSUNA_AZIONE, senza nient'altro.\n"
+        "4. Non inventare MAI un indirizzo email, un nome file o un articolo che non compare nel messaggio o nella "
+        "cronologia recente: se manca, chiedilo (regola 2)."
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    for m in (cronologia_recente or [])[-6:]:
+        _contenuto = (m.get("content") or "")[:500]
+        messages.append({"role": m.get("role", "user"), "content": _contenuto})
+    messages.append({"role": "user", "content": testo_completo})
+
+    try:
+        _client_intento = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        completion = _client_intento.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=messages,
+            tools=GOOGLE_TOOLS_SCHEMA,
+            tool_choice="auto",
+            max_tokens=500,
+        )
+        messaggio = completion.choices[0].message
+        if messaggio.tool_calls:
+            _chiamata = messaggio.tool_calls[0]
+            try:
+                _argomenti = json.loads(_chiamata.function.arguments or "{}")
+            except (ValueError, TypeError):
+                _argomenti = {}
+            return ("AZIONE", {"name": _chiamata.function.name, "arguments": _argomenti})
+        _contenuto_risposta = (messaggio.content or "").strip()
+        if _contenuto_risposta == "NESSUNA_AZIONE" or not _contenuto_risposta:
+            return ("NESSUNA", None)
+        return ("DOMANDA", _contenuto_risposta)
+    except Exception as e:
+        # Fallback sicuro: se Groq non risponde o restituisce qualcosa di
+        # inatteso, si tratta come "nessuna azione" cosi' il messaggio cade
+        # comunque nella chat generica invece di bloccarsi con un errore.
+        print(f"[classificazione intento Google] ERRORE: {type(e).__name__}: {e}", flush=True)
+        return ("NESSUNA", None)
+
+
+# Non abbiamo una rubrica (nessun indirizzo Google e' salvato per gli account
+# di famiglia): per scrivere un'email nuova serve che il destinatario compaia
+# esplicitamente nel messaggio, riconosciuto con questa semplice espressione
+# regolare - usata direttamente dentro _handle_google_agent_logic per
+# ri-validare l'indirizzo estratto dal modello (mai fidarsi ciecamente di un
+# dato "libero" restituito da un LLM per un'azione con effetti reali).
 _RE_INDIRIZZO_EMAIL = re.compile(r"[\w.\+\-]+@[\w\-]+\.[a-zA-Z]{2,}")
-
-
-def _estrai_indirizzo_email(testo):
-    # Non abbiamo una rubrica (nessun indirizzo Google e' salvato per gli
-    # account di famiglia): per scrivere un'email nuova serve che l'utente
-    # indichi l'indirizzo esplicitamente nella frase, riconosciuto qui con
-    # una semplice espressione regolare.
-    m = _RE_INDIRIZZO_EMAIL.search(testo or "")
-    return m.group(0) if m else None
 
 
 def _genera_nuova_email(testo_completo):
@@ -1919,7 +2054,17 @@ def _scegli_connessione_google(utente, testo_completo=""):
     return (None, None)
 
 
-def _handle_google_agent_logic(comando, testo_completo, utente):
+def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
+    # NOTA: "testo_completo" arriva qui SOLO per scegliere l'account giusto
+    # (_scegli_connessione_google riconosce frasi come "di famiglia"/
+    # "condiviso" - logica invariata, non toccata in questo round). Tutti gli
+    # altri dati (articoli, destinatario, nome file, indicazioni) arrivano
+    # gia' estratti e puliti in "argomenti", decisi dal classificatore
+    # d'intento (_classifica_intento_google) invece che da un altro giro di
+    # parsing a parole chiave su testo_completo: usare due volte lo stesso
+    # testo con due logiche diverse (una per l'account, una per i parametri)
+    # sarebbe stato piu' fragile che tenerle separate cosi'.
+    argomenti = argomenti or {}
     if not _google_oauth_enabled():
         return "La connessione con Google non e' ancora configurata su questo server."
 
@@ -1941,22 +2086,17 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
     if _entrambi_collegati:
         _nota_fonte = "\n\n_(account di famiglia)_" if conn_type == "shared" else "\n\n_(il tuo account personale — per la famiglia, chiedi es. \"calendario di famiglia\")_"
 
-    if comando == "verbale_scadenze":
+    if azione_nome == "verbali_mostra_scadenza":
         return _gestisci_verbali_scadenza(utente) + _nota_fonte
 
-    if comando == "verbale_tieni":
-        _nome = testo_completo.strip()
-        if _nome.lower().startswith("tieni"):
-            _nome = _nome[len("tieni"):].strip(" :")
-        return _gestisci_decisione_verbale(creds, "tieni", _nome, utente)
+    if azione_nome == "verbale_decidi":
+        _azione_verbale = argomenti.get("azione")
+        _nome = (argomenti.get("nome_file") or "").strip()
+        if _azione_verbale not in ("tieni", "cancella"):
+            return "Non ho capito se vuoi tenere o cancellare questo verbale: puoi ripetere?"
+        return _gestisci_decisione_verbale(creds, _azione_verbale, _nome, utente) + _nota_fonte
 
-    if comando == "verbale_cancella":
-        _nome = testo_completo.strip()
-        if _nome.lower().startswith("cancella"):
-            _nome = _nome[len("cancella"):].strip(" :")
-        return _gestisci_decisione_verbale(creds, "cancella", _nome, utente)
-
-    if comando == "calendario":
+    if azione_nome == "leggi_calendario":
         eventi = _list_calendar_events(creds, max_results=10)
         if eventi is None:
             return "Non sono riuscito a leggere il calendario in questo momento."
@@ -1969,29 +2109,25 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
             righe.append(f"- {_inizio}: {_titolo}")
         return "Ecco i prossimi impegni nel calendario:\n" + "\n".join(righe) + _nota_fonte
 
-    if comando == "lista_spesa":
-        _t = (testo_completo or "").lower()
-        if any(k in _t for k in ["mostra", "vedi", "che c'e' nella", "che c'è nella", "cosa devo comprare", "cosa manca", "fammi vedere", "fai vedere"]):
-            _azione = "mostra"
-        elif any(k in _t for k in ["ho comprato", "ho preso", "segna come compr", "gia' compr", "già compr", "ho gia' preso", "ho già preso"]):
-            _azione = "comprato"
-        elif any(k in _t for k in ["aggiung", "metti", "servono", "serve ", "compra "]):
-            _azione = "aggiungi"
-        else:
-            # Frase con "spesa" ma senza un verbo riconosciuto (es. solo
-            # "lista della spesa"): mostra la lista invece di non fare nulla,
-            # e' l'interpretazione piu' utile in assenza di indicazioni.
-            _azione = "mostra"
-
-        _articoli = []
-        if _azione in ("aggiungi", "comprato"):
-            _parole_trigger = ["aggiungi", "aggiungimi", "aggiungere", "metti", "servono", "serve ", "compra "] if _azione == "aggiungi" else ["ho comprato", "ho preso", "ho gia' preso", "ho già preso"]
-            _articoli = _estrai_articoli_spesa(testo_completo, _parole_trigger)
-
-        _risultato = _gestisci_lista_spesa(creds, _azione, _articoli, utente.get("name"))
+    if azione_nome == "lista_spesa_aggiungi":
+        _articoli = argomenti.get("articoli") or []
+        if not _articoli:
+            return "Non ho capito quali articoli aggiungere: puoi ripetermeli?"
+        _risultato = _gestisci_lista_spesa(creds, "aggiungi", _articoli, utente.get("name"))
         return (_risultato or "Non sono riuscito a completare l'operazione sulla lista della spesa.") + _nota_fonte
 
-    if comando == "leggi_posta":
+    if azione_nome == "lista_spesa_mostra":
+        _risultato = _gestisci_lista_spesa(creds, "mostra", [], utente.get("name"))
+        return (_risultato or "Non sono riuscito a leggere la lista della spesa.") + _nota_fonte
+
+    if azione_nome == "lista_spesa_segna_comprato":
+        _articoli = argomenti.get("articoli") or []
+        if not _articoli:
+            return "Non ho capito quali articoli segnare come comprati: puoi ripetermeli?"
+        _risultato = _gestisci_lista_spesa(creds, "comprato", _articoli, utente.get("name"))
+        return (_risultato or "Non sono riuscito a completare l'operazione sulla lista della spesa.") + _nota_fonte
+
+    if azione_nome == "leggi_posta":
         emails = _list_recent_emails(creds, limit=5)
         if emails is None:
             return "Non sono riuscito a leggere la posta in questo momento."
@@ -2000,14 +2136,21 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
         righe = [f"- Da {em['from']} — {em['subject']}: {em['snippet']}" for em in emails]
         return "Ecco le email piu' recenti:\n" + "\n".join(righe) + _nota_fonte
 
-    if comando == "nuova_email":
-        _destinatario = _estrai_indirizzo_email(testo_completo)
+    if azione_nome == "scrivi_nuova_email":
+        # Il modello estrae gia' l'indirizzo dal messaggio, ma non ci si fida
+        # mai ciecamente di un dato "libero" restituito da un LLM per
+        # un'azione con effetti reali: lo si ri-valida qui con _RE_INDIRIZZO_EMAIL,
+        # estraendo solo la parte che sembra davvero un indirizzo email
+        # (tollera eventuale testo extra intorno, es. "a: mario@rossi.it").
+        _match_indirizzo = _RE_INDIRIZZO_EMAIL.search((argomenti.get("destinatario") or "").strip())
+        _destinatario = _match_indirizzo.group(0) if _match_indirizzo else None
+        _indicazioni = argomenti.get("indicazioni") or ""
         if not _destinatario:
             return (
                 "Posso preparare una nuova email, ma non ho una rubrica: dimmi anche l'indirizzo email "
                 "del destinatario nella stessa frase (es. \"manda una email a mario@esempio.com dicendo che...\")."
             )
-        _oggetto_nuova, _corpo_nuovo = _genera_nuova_email(testo_completo)
+        _oggetto_nuova, _corpo_nuovo = _genera_nuova_email(f"Scrivi una email a {_destinatario}: {_indicazioni}")
         if not _corpo_nuovo:
             return "Non sono riuscito a generare il testo dell'email in questo momento."
         draft = _create_email_draft(creds, _destinatario, _oggetto_nuova, _corpo_nuovo)
@@ -2028,16 +2171,17 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
             "qui sopra nella chat per inviarla subito o scartarla."
         )
 
-    if comando == "bozza_risposta":
+    if azione_nome == "rispondi_ultima_email":
         emails = _list_recent_emails(creds, limit=1)
         if not emails:
             return "Non trovo nessuna email recente a cui rispondere."
         ultima = emails[0]
+        _indicazioni = argomenti.get("indicazioni") or ""
         try:
             _prompt_bozza = (
                 "Scrivi una breve risposta educata in italiano a questa email.\n"
                 f"Da: {ultima['from']}\nOggetto: {ultima['subject']}\nContenuto: {ultima['snippet']}\n\n"
-                f"Indicazioni dell'utente su cosa rispondere: {testo_completo}\n\n"
+                f"Indicazioni dell'utente su cosa rispondere: {_indicazioni}\n\n"
                 "Scrivi solo il testo della risposta, senza oggetto ne' indicazioni tecniche."
             )
             _groq_api_key_locale = os.environ.get("GROQ_API_KEY")
@@ -2073,7 +2217,7 @@ def _handle_google_agent_logic(comando, testo_completo, utente):
             "qui sopra nella chat per inviarla subito o scartarla."
         )
 
-    return None
+    return "Ho capito cosa intendi ma non sono riuscito a portarlo a termine: puoi riprovare?"
 
 
 def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None, location_text=None, current_user_name=None):
@@ -2087,11 +2231,43 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "(es. 'spiegami meglio', 'in dettaglio', 'più lungo').\n\n"
         f"{_contesto_temporale()}"
     )
+    # Regola ferrea sulle capacita' reali: questa e' la chat generica, usata
+    # SOLO quando il messaggio non ha attivato uno dei comandi reali gia'
+    # riconosciuti automaticamente (calendario/posta/lista della spesa/
+    # verbali audio - gestiti altrove, con vere chiamate alle API di Google,
+    # MAI qui). Senza questa regola esplicita, un modello linguistico tende a
+    # generare una risposta "plausibile" e completa anche per richieste che
+    # non puo' davvero eseguire (creare un file, salvarlo su Drive, generare
+    # un link di download) - inventando link e dettagli che sembrano reali ma
+    # non lo sono. Verificato che questo e' successo davvero (richiesta di
+    # una presentazione PowerPoint/Google Slides: risposta con link Drive
+    # completamente finti). Questa regola ha sempre la precedenza sulle
+    # istruzioni permanenti dell'utente qui sotto, che restano indicazioni di
+    # stile/priorita' ma non possono mai concedere una capacita' tecnica che
+    # l'app non ha davvero.
+    system_prompt += (
+        "\n\nREGOLA FERREA SULLE TUE CAPACITA' REALI (non violarla mai, nemmeno se le istruzioni permanenti "
+        "piu' sotto sembrano suggerire il contrario): in questa conversazione generica NON hai alcun modo di "
+        "creare o modificare davvero file su Google Drive/Sheets/Slides/Docs, ne' di generare link di download "
+        "funzionanti. Le uniche azioni reali su Google che l'app sa fare sono attivate da comandi specifici "
+        "riconosciuti automaticamente PRIMA di arrivare qui (calendario, lettura/bozze email Gmail, lista della "
+        "spesa su un foglio Google dedicato, verbali audio con Google Doc + promemoria) - se stai rispondendo tu "
+        "in questa chat generica, quei comandi non si sono attivati. Se l'utente chiede qualcosa che non sai "
+        "davvero fare (es. creare una presentazione PowerPoint/Google Slides, un foglio Google generico, "
+        "qualsiasi altro file scaricabile), NON DEVI MAI: inventare un link (docs.google.com, drive.google.com o "
+        "qualsiasi URL), descrivere un'azione come gia' avvenuta ('ho creato...', 'ho salvato...', 'ecco il "
+        "link...') se non l'hai davvero fatta, o dare istruzioni che presuppongono l'esistenza di un file che non "
+        "esiste. Di' onestamente che questa funzione non e' ancora disponibile nell'app, e proponi un'alternativa "
+        "reale che puoi davvero fare adesso (es. scrivere qui il contenuto in modo che l'utente possa copiarlo o "
+        "incollarlo altrove)."
+    )
     if location_text:
         system_prompt += f"\nPosizione approssimativa dell'utente: {location_text}."
     if knowledge_text and knowledge_text.strip():
         system_prompt += (
-            "\n\nInformazioni e istruzioni permanenti fornite dall'utente: seguile sempre.\n"
+            "\n\nIndicazioni permanenti fornite dall'utente (tono, priorita', contenuti): seguile sempre PER "
+            "QUESTO, ma non ti concedono mai una capacita' tecnica in piu' di quelle reali descritte sopra - "
+            "in caso di conflitto vince sempre la regola sulle capacita' reali.\n"
             + knowledge_text.strip()
         )
 
@@ -3276,8 +3452,29 @@ else:
         _comando_verbale_nuovo_attivo = (not _comando_addestramento_attivo) and _testo_comando_verbale_nuovo(testo_completo)
         # Il comando Google (calendario/posta/lista spesa/verbali) e'
         # controllato solo se non sono gia' attivi i due comandi sopra, per
-        # evitare ambiguita' tra loro.
-        _comando_google = None if (_comando_addestramento_attivo or _comando_verbale_nuovo_attivo) else _testo_comando_google(testo_completo)
+        # evitare ambiguita' tra loro. Da questo round non e' piu' un
+        # controllo a parole chiave: e' Groq stesso (function calling) a
+        # capire dal significato del messaggio se si tratta di una di queste
+        # azioni, chiedendo un chiarimento se manca un dettaglio invece di
+        # indovinare - vedi _classifica_intento_google.
+        _argomenti_google = None
+        if _comando_addestramento_attivo or _comando_verbale_nuovo_attivo:
+            _comando_google = None
+        else:
+            _tipo_intento_google, _valore_intento_google = _classifica_intento_google(
+                testo_completo, st.session_state.messages, st.session_state.current_user,
+            )
+            if _tipo_intento_google == "AZIONE":
+                _comando_google = _valore_intento_google["name"]
+                _argomenti_google = _valore_intento_google["arguments"]
+            elif _tipo_intento_google == "DOMANDA":
+                # Sentinella interna (non un vero nome di azione): segnala al
+                # ramo di dispatch piu' sotto che la risposta e' gia' pronta
+                # (la domanda di chiarimento stessa), senza toccare Google.
+                _comando_google = "chiarimento_google"
+                _argomenti_google = {"domanda": _valore_intento_google}
+            else:
+                _comando_google = None
 
         if _comando_addestramento_attivo:
             # Il comando "addestramento" salva testo/file nella memoria
@@ -3328,6 +3525,7 @@ else:
         _comando_addestramento_attivo = False
         _comando_verbale_nuovo_attivo = False
         _comando_google = None
+        _argomenti_google = None
 
     # Ora che sappiamo se in questo giro arriva anche una risposta nuova,
     # possiamo riempire (o lasciare vuoto) il segnaposto del pulsante 🔊
@@ -3381,12 +3579,21 @@ else:
                 # preparata sopra (creazione vera del verbale, o richiesta di
                 # registrare un vocale se non ne era presente uno).
                 response = risposta_verbale_nuovo
+            elif _comando_google == "chiarimento_google":
+                # Il classificatore ha riconosciuto che la richiesta riguarda
+                # una di queste azioni ma mancano dettagli per eseguirla
+                # davvero (es. quale indirizzo, quale articolo, quale
+                # verbale): si fa la domanda di chiarimento gia' pronta,
+                # invece di indovinare o di cadere nella chat generica (che
+                # comunque non saprebbe eseguire l'azione).
+                response = _argomenti_google["domanda"]
             elif _comando_google:
-                # Comando Google (calendario/posta): niente chiamata al
+                # Comando Google riconosciuto dal significato del messaggio
+                # (non piu' da parole chiave fisse): niente chiamata al
                 # modello Groq per la risposta principale, si usa Calendar/
-                # Gmail direttamente tramite l'account collegato dall'utente
-                # (o quello condiviso di famiglia, se genitore).
-                response = _handle_google_agent_logic(_comando_google, testo_completo, st.session_state.current_user)
+                # Gmail/Sheets/Drive direttamente tramite l'account collegato
+                # dall'utente (o quello condiviso di famiglia, se genitore).
+                response = _handle_google_agent_logic(_comando_google, _argomenti_google, st.session_state.current_user, testo_completo)
             else:
                 def is_too_large_error(exc):
                     msg = str(exc).lower()
