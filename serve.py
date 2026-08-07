@@ -458,6 +458,21 @@ async def telegram_webhook(request):
         if not _testo:
             _telegram_invia_messaggio(_chat_id, "Non sono riuscito a trascrivere il vocale: puoi riprovare o scrivere il messaggio?")
             return JSONResponse({"ok": True})
+    if not _testo and (
+        _messaggio.get("photo") or _messaggio.get("document") or _messaggio.get("video")
+        or _messaggio.get("video_note") or _messaggio.get("sticker") or _messaggio.get("animation")
+    ):
+        # Bug round 20 (segnalato dall'utente): prima di questo fix, foto/
+        # documenti/video arrivavano qui senza testo e senza corrispondere a
+        # "voice", quindi cadevano nel "if not _testo: return" sottostante e
+        # il bot restava in silenzio totale, senza dire nulla - sembrava
+        # rotto invece di limitato. Ora risponde onestamente.
+        _telegram_invia_messaggio(
+            _chat_id,
+            "Da qui su Telegram non sono ancora in grado di leggere foto, documenti o video: per ora capisco solo "
+            "testo e messaggi vocali. Per allegati e verbali audio usa l'app web.",
+        )
+        return JSONResponse({"ok": True})
     if not _testo:
         return JSONResponse({"ok": True})
 
