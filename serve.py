@@ -417,6 +417,11 @@ async def telegram_webhook(request):
 
     _utente = _telegram_utente_da_id(_telegram_id)
     if not _utente:
+        _nome_da = _messaggio.get("from", {}).get("first_name", "")
+        print(
+            f"[telegram] utente non riconosciuto: telegram_id={_telegram_id} chat_id={_chat_id} nome={_nome_da!r}",
+            flush=True,
+        )
         _telegram_invia_messaggio(
             _chat_id,
             "Non riconosco questo account Telegram: collegalo prima dall'app web, sezione \"Collegamenti Google\" "
