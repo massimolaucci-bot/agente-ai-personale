@@ -1243,6 +1243,91 @@ def _send_email_draft(creds, draft_id):
         return None
 
 
+# --- Bozze email in sospeso: persistenza su Supabase, non solo st.session_state ---
+# Bug reale segnalato dall'utente (round 19): il pulsante "Invia/Scarta" della
+# bozza vive per costruzione in st.session_state, legato alla connessione
+# WebSocket del browser. Se quella connessione si interrompe per qualunque
+# motivo (pagina ricaricata, app messa in background su mobile, riavvio del
+# container Render sul piano gratuito), Streamlit riparte con uno
+# session_state vuoto: la bozza esiste ancora davvero su Gmail, ma il
+# pulsante per confermarla dalla chat sparisce senza che l'utente capisca
+# perche' (l'assistente continua comunque a promettere "usa il pulsante qui
+# sopra", cosa non piu' vera in quel momento). Fix: salvare ogni bozza anche
+# su Supabase (stesso pattern gia' in uso per i verbali audio in
+# "audio_transcriptions": colonna status pending/sent/discarded) e
+# ricaricarla in session_state a ogni avvio/rerun se non e' gia' presente,
+# cosi' il pulsante sopravvive a qualunque interruzione di sessione.
+def _salva_bozza_email_pendente_db(draft_id, conn_type, conn_user_id, to_addr, subject, body):
+    if not _supabase_enabled():
+        return False
+    try:
+        payload = {
+            "draft_id": draft_id,
+            "conn_type": conn_type,
+            "conn_user_id": conn_user_id,
+            "to_addr": to_addr,
+            "subject": subject,
+            "body": body,
+            "status": "pending",
+        }
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/pending_email_drafts",
+            headers=SUPABASE_HEADERS, json=payload, timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[email] salvataggio bozza pendente su Supabase fallito: {e}", flush=True)
+        return False
+
+
+def _elenca_bozze_email_pendenti_db(utente):
+    if not _supabase_enabled():
+        return []
+    try:
+        _uid = utente.get("id")
+        # Un utente vede le bozze pendenti sull'account condiviso di famiglia
+        # (chiunque le ha create) e quelle sul proprio account personale -
+        # mai le bozze personali di un altro membro della famiglia. Filtro
+        # fatto lato Python (non con la sintassi "or" di PostgREST) per
+        # restare semplice e facilmente testabile con il mock locale, che
+        # implementa solo i filtri "eq."/"ilike."/"lte."/"gte." per colonna.
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/pending_email_drafts",
+            headers=SUPABASE_HEADERS,
+            params={"select": "*", "status": "eq.pending", "order": "created_at.asc"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        _righe = r.json()
+        return [
+            _riga for _riga in _righe
+            if _riga.get("conn_type") == "shared"
+            or (_riga.get("conn_type") == "personal" and str(_riga.get("conn_user_id")) == str(_uid))
+        ]
+    except Exception as e:
+        print(f"[email] lettura bozze pendenti da Supabase fallita: {e}", flush=True)
+        return []
+
+
+def _aggiorna_stato_bozza_email_db(draft_id, nuovo_stato):
+    if not _supabase_enabled():
+        return False
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/pending_email_drafts",
+            headers=SUPABASE_HEADERS,
+            params={"draft_id": f"eq.{draft_id}"},
+            json={"status": nuovo_stato},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[email] aggiornamento stato bozza pendente fallito: {e}", flush=True)
+        return False
+
+
 # --- Google Sheets: lista della spesa condivisa ------------------------------
 # Round 13: aggiunta su richiesta dell'utente (roadmap "Fase 1: Google
 # Sheets"). Usa lo scope "drive.file" (non il piu' ampio "drive"): l'app puo'
@@ -1993,7 +2078,13 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
         "argomenti, richieste che l'app non sa fare come creare presentazioni o altri file), NON chiamare nessun "
         "tool e rispondi ESATTAMENTE con il testo NESSUNA_AZIONE, senza nient'altro.\n"
         "4. Non inventare MAI un indirizzo email, un nome file o un articolo che non compare nel messaggio o nella "
-        "cronologia recente: se manca, chiedilo (regola 2)."
+        "cronologia recente: se manca, chiedilo (regola 2).\n"
+        "5. Per motivi di sicurezza, un indirizzo email per scrivere/rispondere a una mail viene accettato SOLO se "
+        "compare per esteso nell'ULTIMO messaggio dell'utente, anche se lo aveva gia' scritto in un messaggio "
+        "precedente della stessa conversazione. Se nella cronologia vedi che l'utente ha gia' indicato un "
+        "indirizzo in un turno precedente ma non lo ripete in questo messaggio, NON dire che non hai ricevuto "
+        "nessun indirizzo: spiega invece chiaramente che per sicurezza serve riscriverlo per esteso in questo "
+        "stesso messaggio, e chiedigli di farlo."
     )
     messages = [{"role": "system", "content": system_prompt}]
     for m in (cronologia_recente or [])[-6:]:
@@ -2079,6 +2170,233 @@ def _genera_nuova_email(testo_completo):
     if not _oggetto:
         _oggetto = "(senza oggetto)"
     return _oggetto, _corpo
+
+
+# --- Composizione email guidata a stati (round 19bis, richiesta esplicita ---
+# dell'utente): il vecchio flusso lasciava a Groq (function calling) la
+# decisione di quando un'email era "pronta" da inviare, in un solo passaggio
+# - quando l'estrazione falliva (indirizzo non compilato, messaggio ambiguo),
+# il classificatore poteva rispondere in modo confuso o fuori contesto (bug
+# osservato dall'utente: "non ho ricevuto alcun indirizzo" quando l'aveva
+# gia' scritto, o risposte generiche su un messaggio successivo non
+# pertinente). Qui invece il controllo di flusso e' del tutto deterministico
+# (macchina a stati in Python, mai Groq): una volta avviata la composizione,
+# OGNI messaggio dell'utente viene interpretato SOLO come risposta alla
+# domanda corrente (mai passato al classificatore d'intento), un passo alla
+# volta, senza nessuna inferenza IA se non nel passo 4 (formattazione del
+# testo finale, esplicitamente richiesta dall'utente). Lo stato e' salvato
+# sia in st.session_state sia su Supabase (stesso principio del fix alle
+# bozze pendenti sopra): sopravvive a un reload o a una riconnessione.
+_STATO_ATTESA_INDIRIZZO = "waiting_address"
+_STATO_ATTESA_OGGETTO = "waiting_subject"
+_STATO_ATTESA_CORPO = "waiting_body"
+_STATO_ATTESA_CONFERMA = "waiting_confirm"
+
+_PAROLE_ANNULLA_COMPOSIZIONE = (
+    "annulla", "lascia stare", "niente", "stop", "basta cosi", "basta così",
+    "non importa", "cancella tutto", "dimentica",
+)
+_PAROLE_CONFERMA_INVIO = ("invia", "manda", "mandala", "inviala", "spediscila", "conferma", "si invia", "sì invia")
+
+
+def _e_messaggio_di_annullamento(testo):
+    t = (testo or "").strip().lower()
+    return any(t == p or t.startswith(p + " ") or t.startswith(p + ",") for p in _PAROLE_ANNULLA_COMPOSIZIONE)
+
+
+def _leggi_stato_composizione_email(utente):
+    # Prima session_state (rapido, stesso giro), poi Supabase come recupero
+    # (sessione persa/riavvio) - stesso schema del fix alle bozze pendenti.
+    _stato_sessione = st.session_state.get("email_compose_state")
+    if _stato_sessione:
+        return _stato_sessione
+    if not _supabase_enabled():
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/email_compose_state",
+            headers=SUPABASE_HEADERS,
+            params={"select": "*", "user_id": f"eq.{utente.get('id')}"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        r.raise_for_status()
+        _righe = r.json()
+        if not _righe:
+            return None
+        _riga = _righe[0]
+        _stato = {
+            "state": _riga.get("state"),
+            "conn_type": _riga.get("conn_type"),
+            "conn_user_id": _riga.get("conn_user_id"),
+            "destinatario": _riga.get("destinatario"),
+            "oggetto": _riga.get("oggetto"),
+            "indicazioni": _riga.get("indicazioni_corpo"),
+            "draft_id": _riga.get("draft_id"),
+        }
+        st.session_state["email_compose_state"] = _stato
+        return _stato
+    except Exception as e:
+        print(f"[email] lettura stato composizione da Supabase fallita: {e}", flush=True)
+        return None
+
+
+def _salva_stato_composizione_email(utente, stato):
+    st.session_state["email_compose_state"] = stato
+    if not _supabase_enabled():
+        return
+    try:
+        payload = {
+            "user_id": utente.get("id"),
+            "state": stato["state"],
+            "conn_type": stato.get("conn_type"),
+            "conn_user_id": stato.get("conn_user_id"),
+            "destinatario": stato.get("destinatario"),
+            "oggetto": stato.get("oggetto"),
+            "indicazioni_corpo": stato.get("indicazioni"),
+            "draft_id": stato.get("draft_id"),
+        }
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/email_compose_state",
+            headers={**SUPABASE_HEADERS, "Prefer": "resolution=merge-duplicates"},
+            json=payload, timeout=SUPABASE_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"[email] salvataggio stato composizione su Supabase fallito: {e}", flush=True)
+
+
+def _cancella_stato_composizione_email(utente):
+    st.session_state.pop("email_compose_state", None)
+    if not _supabase_enabled():
+        return
+    try:
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/email_compose_state",
+            headers=SUPABASE_HEADERS,
+            params={"user_id": f"eq.{utente.get('id')}"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"[email] cancellazione stato composizione su Supabase fallita: {e}", flush=True)
+
+
+def _genera_solo_corpo_email(oggetto, indicazioni):
+    # Passo 4 del protocollo: Groq viene usato SOLO per formattare il testo
+    # dell'email (tono/contenuto) sulla base delle indicazioni dell'utente -
+    # l'oggetto e il destinatario restano quelli decisi dall'utente nei passi
+    # precedenti, mai reinventati qui.
+    try:
+        _prompt = (
+            "L'utente vuole scrivere una NUOVA email. Ha gia' deciso oggetto e destinatario altrove: "
+            "il tuo unico compito e' scrivere SOLO il testo del messaggio (corpo dell'email), educato e in "
+            "italiano, seguendo le indicazioni sul contenuto e sul tono date dall'utente. Non aggiungere "
+            "un oggetto, non ripetere l'oggetto nel testo.\n\n"
+            f"Oggetto (gia' deciso, solo per contesto): {oggetto}\n"
+            f"Indicazioni dell'utente su cosa scrivere e con che tono: {indicazioni}\n\n"
+            "Scrivi solo il testo del messaggio, senza premesse ne' indicazioni tecniche."
+        )
+        _client_corpo = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        _completamento = _client_corpo.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=[{"role": "user", "content": _prompt}],
+            max_tokens=400,
+        )
+        _corpo = (_completamento.choices[0].message.content or "").strip()
+        return _corpo or None
+    except Exception as e:
+        print(f"[email] _genera_solo_corpo_email fallita: {e}", flush=True)
+        return None
+
+
+def _gestisci_step_composizione_email(testo_completo, utente, stato):
+    """Avanza di un passo la macchina a stati della composizione email.
+    Non chiama MAI il classificatore d'intento: il testo del messaggio viene
+    interpretato solo come risposta al passo corrente. Ritorna il testo di
+    risposta da mostrare in chat; lo stato viene gia' aggiornato/salvato
+    internamente (session_state + Supabase)."""
+    if _e_messaggio_di_annullamento(testo_completo):
+        _cancella_stato_composizione_email(utente)
+        return "Ok, ho annullato la composizione dell'email: non è stata salvata né inviata nessuna bozza."
+
+    _fase = stato["state"]
+
+    if _fase == _STATO_ATTESA_INDIRIZZO:
+        _match = _RE_INDIRIZZO_EMAIL.search(testo_completo or "")
+        if not _match:
+            return "Non ho trovato un indirizzo email valido nel messaggio: a quale indirizzo devo spedirla? (scrivi \"annulla\" per lasciar perdere)"
+        stato["destinatario"] = _match.group(0)
+        stato["state"] = _STATO_ATTESA_OGGETTO
+        _salva_stato_composizione_email(utente, stato)
+        return f"Indirizzo salvato: {stato['destinatario']}. Qual è l'oggetto dell'email?"
+
+    if _fase == _STATO_ATTESA_OGGETTO:
+        _oggetto = (testo_completo or "").strip()
+        if not _oggetto:
+            return "Non ho capito l'oggetto: puoi ripeterlo? (scrivi \"annulla\" per lasciar perdere)"
+        stato["oggetto"] = _oggetto
+        stato["state"] = _STATO_ATTESA_CORPO
+        _salva_stato_composizione_email(utente, stato)
+        return "Oggetto salvato. Cosa devo scrivere nel testo e con che tono?"
+
+    if _fase == _STATO_ATTESA_CORPO:
+        _indicazioni = (testo_completo or "").strip()
+        if not _indicazioni:
+            return "Non ho capito cosa scrivere: puoi ripetere il contenuto e il tono desiderato? (scrivi \"annulla\" per lasciar perdere)"
+        stato["indicazioni"] = _indicazioni
+        _corpo = _genera_solo_corpo_email(stato["oggetto"], _indicazioni)
+        if not _corpo:
+            return "Non sono riuscito a generare il testo dell'email in questo momento: puoi riprovare a descrivere cosa scrivere?"
+
+        creds = _get_google_credentials(stato.get("conn_type"), stato.get("conn_user_id"))
+        if not creds:
+            _cancella_stato_composizione_email(utente)
+            return "Il collegamento con Google non è più disponibile: ho annullato la composizione, ricollega l'account e riprova."
+        draft = _create_email_draft(creds, stato["destinatario"], stato["oggetto"], _corpo)
+        if not draft:
+            _cancella_stato_composizione_email(utente)
+            return "Ho preparato il testo ma non sono riuscito a salvarlo come bozza su Gmail. Puoi riprovare da capo."
+
+        st.session_state.setdefault("pending_google_drafts", {})
+        st.session_state["pending_google_drafts"][draft["id"]] = {
+            "conn_type": stato.get("conn_type"),
+            "conn_user_id": stato.get("conn_user_id"),
+            "to": stato["destinatario"],
+            "subject": stato["oggetto"],
+            "body": _corpo,
+        }
+        _salva_bozza_email_pendente_db(
+            draft["id"], stato.get("conn_type"), stato.get("conn_user_id"), stato["destinatario"], stato["oggetto"], _corpo,
+        )
+        stato["draft_id"] = draft["id"]
+        stato["state"] = _STATO_ATTESA_CONFERMA
+        _salva_stato_composizione_email(utente, stato)
+        return (
+            f"Ecco la bozza per {stato['destinatario']} (oggetto: \"{stato['oggetto']}\"):\n\n"
+            f"{_corpo}\n\n"
+            "Scrivi \"invia\" per spedirla subito, oppure usa il pulsante di conferma qui sopra nella chat "
+            "per inviarla o scartarla."
+        )
+
+    if _fase == _STATO_ATTESA_CONFERMA:
+        _testo_norm = (testo_completo or "").strip().lower()
+        if _testo_norm in _PAROLE_CONFERMA_INVIO:
+            # Passo 5: esecuzione diretta, nessuna ulteriore inferenza IA -
+            # stessa funzione _send_email_draft gia' usata dal pulsante "Invia".
+            creds = _get_google_credentials(stato.get("conn_type"), stato.get("conn_user_id"))
+            _inviata = creds and _send_email_draft(creds, stato["draft_id"])
+            if _inviata:
+                st.session_state.get("pending_google_drafts", {}).pop(stato["draft_id"], None)
+                _aggiorna_stato_bozza_email_db(stato["draft_id"], "sent")
+                _cancella_stato_composizione_email(utente)
+                return f"Email inviata a {stato['destinatario']}."
+            return "Invio non riuscito, riprova tra poco oppure usa il pulsante di conferma qui sopra nella chat."
+        return (
+            "La bozza è pronta e in attesa: scrivi \"invia\" per spedirla, \"annulla\" per scartarla, "
+            "oppure usa il pulsante qui sopra nella chat."
+        )
+
+    # Stato non riconosciuto (non dovrebbe succedere): reset difensivo.
+    _cancella_stato_composizione_email(utente)
+    return "Qualcosa non ha funzionato nella composizione dell'email: ho annullato, puoi ricominciare."
 
 
 def _richiesta_riguarda_famiglia(testo):
@@ -2209,48 +2527,42 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
         return "Ecco le email piu' recenti:\n" + "\n".join(righe) + _nota_fonte
 
     if azione_nome == "scrivi_nuova_email":
-        # Il modello estrae gia' l'indirizzo dal messaggio, ma non ci si fida
-        # mai ciecamente di un dato "libero" restituito da un LLM per
-        # un'azione con effetti reali. Due controlli, non uno solo:
-        # 1) il formato dev'essere quello di un indirizzo email vero
-        #    (_RE_INDIRIZZO_EMAIL, tollera testo extra intorno come "a: ...");
-        # 2) quell'indirizzo deve comparire LETTERALMENTE nel messaggio
-        #    dell'utente (case-insensitive) - senza questo secondo controllo,
-        #    un modello di function calling puo' "completare" un indirizzo
-        #    plausibile ma inventato (es. da un nome proprio come "Massimo
-        #    Laucci") che supera comunque il controllo di formato: e' lo
-        #    stesso tipo di allucinazione che il blocco nella chat generica
-        #    previene altrove, qui va prevenuta anche nei parametri estratti.
+        # Round 19bis: la creazione in un solo colpo (estrai indirizzo +
+        # genera oggetto/corpo + salva bozza) e' stata sostituita da una
+        # macchina a stati esplicita (_gestisci_step_composizione_email),
+        # su richiesta diretta dell'utente - qui si fa SOLO il primo passo:
+        # capire se l'indirizzo e' gia' presente nel messaggio che ha
+        # attivato l'azione (stesso controllo anti-allucinazione di sempre:
+        # il modello puo' "completare" un indirizzo plausibile ma inventato
+        # da un nome proprio, quindi va verificato che compaia letteralmente
+        # nel testo). Se manca, si entra nello stato "in attesa
+        # dell'indirizzo" e la domanda viene fatta in modo deterministico,
+        # non da Groq.
         _match_indirizzo = _RE_INDIRIZZO_EMAIL.search((argomenti.get("destinatario") or "").strip())
         _destinatario = _match_indirizzo.group(0) if _match_indirizzo else None
         if _destinatario and _destinatario.lower() not in (testo_completo or "").lower():
             _destinatario = None
-        _indicazioni = argomenti.get("indicazioni") or ""
         if not _destinatario:
-            return (
-                "Posso preparare una nuova email, ma non ho una rubrica: dimmi anche l'indirizzo email "
-                "del destinatario nella stessa frase (es. \"manda una email a mario@esempio.com dicendo che...\")."
-            )
-        _oggetto_nuova, _corpo_nuovo = _genera_nuova_email(f"Scrivi una email a {_destinatario}: {_indicazioni}")
-        if not _corpo_nuovo:
-            return "Non sono riuscito a generare il testo dell'email in questo momento."
-        draft = _create_email_draft(creds, _destinatario, _oggetto_nuova, _corpo_nuovo)
-        if not draft:
-            return "Ho preparato il testo ma non sono riuscito a salvarlo come bozza su Gmail."
-        st.session_state.setdefault("pending_google_drafts", {})
-        st.session_state["pending_google_drafts"][draft["id"]] = {
+            _match_diretto = _RE_INDIRIZZO_EMAIL.search(testo_completo or "")
+            if _match_diretto:
+                _destinatario = _match_diretto.group(0)
+
+        _nuovo_stato = {
+            "state": _STATO_ATTESA_INDIRIZZO,
             "conn_type": conn_type,
             "conn_user_id": conn_user_id,
-            "to": _destinatario,
-            "subject": _oggetto_nuova,
-            "body": _corpo_nuovo,
+            "destinatario": None,
+            "oggetto": None,
+            "indicazioni": None,
+            "draft_id": None,
         }
-        return (
-            f"Ho preparato una bozza di email nuova per {_destinatario} (oggetto: \"{_oggetto_nuova}\"):\n\n"
-            f"{_corpo_nuovo}\n\n"
-            "Non l'ho inviata: la trovi anche tra le bozze di Gmail, oppure usa il pulsante di conferma "
-            "qui sopra nella chat per inviarla subito o scartarla."
-        )
+        if _destinatario:
+            _nuovo_stato["destinatario"] = _destinatario
+            _nuovo_stato["state"] = _STATO_ATTESA_OGGETTO
+            _salva_stato_composizione_email(utente, _nuovo_stato)
+            return f"Indirizzo: {_destinatario}. Qual è l'oggetto dell'email?"
+        _salva_stato_composizione_email(utente, _nuovo_stato)
+        return "A quale indirizzo email devo spedirla? (scrivi \"annulla\" in qualsiasi momento per lasciar perdere)"
 
     if azione_nome == "rispondi_ultima_email":
         emails = _list_recent_emails(creds, limit=1)
@@ -2291,6 +2603,7 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
             "subject": _oggetto_risposta,
             "body": _testo_bozza,
         }
+        _salva_bozza_email_pendente_db(draft["id"], conn_type, conn_user_id, _mittente, _oggetto_risposta, _testo_bozza)
         return (
             f"Ho preparato una bozza di risposta a {_mittente} (oggetto: \"{_oggetto_risposta}\"):\n\n"
             f"{_testo_bozza}\n\n"
@@ -3606,6 +3919,27 @@ else:
     # sopravvivono a un rerun di Streamlit finche' non vengono inviate o
     # scartate esplicitamente. Non si invia MAI un'email dal solo testo
     # scritto in chat: serve sempre questo pulsante di conferma esplicito.
+    #
+    # Riconciliazione con Supabase (bug reale round 19, "non vedo il
+    # pulsante"): st.session_state da solo non sopravvive a un reload della
+    # pagina o a un riavvio del server - la bozza pero' esiste gia' su Gmail
+    # E su Supabase (_salva_bozza_email_pendente_db), quindi ad ogni giro si
+    # recuperano da li' le bozze ancora pendenti dell'utente corrente e si
+    # ricostruisce session_state se mancante, invece di lasciare il pulsante
+    # sparire silenziosamente.
+    st.session_state.setdefault("pending_google_drafts", {})
+    if st.session_state.get("current_user"):
+        for _riga_db in _elenca_bozze_email_pendenti_db(st.session_state.current_user):
+            _id_bozza_db = _riga_db.get("draft_id")
+            if _id_bozza_db and _id_bozza_db not in st.session_state["pending_google_drafts"]:
+                st.session_state["pending_google_drafts"][_id_bozza_db] = {
+                    "conn_type": _riga_db.get("conn_type"),
+                    "conn_user_id": _riga_db.get("conn_user_id"),
+                    "to": _riga_db.get("to_addr"),
+                    "subject": _riga_db.get("subject"),
+                    "body": _riga_db.get("body"),
+                }
+
     _bozze_google_in_sospeso = st.session_state.get("pending_google_drafts") or {}
     if _bozze_google_in_sospeso:
         st.markdown("---")
@@ -3620,6 +3954,7 @@ else:
                         _creds_invio = _get_google_credentials(_info["conn_type"], _info["conn_user_id"])
                         if _creds_invio and _send_email_draft(_creds_invio, _draft_id):
                             st.session_state["pending_google_drafts"].pop(_draft_id, None)
+                            _aggiorna_stato_bozza_email_db(_draft_id, "sent")
                             st.success("Email inviata.")
                             st.rerun()
                         else:
@@ -3627,6 +3962,7 @@ else:
                 with _col_scarta:
                     if st.button("🗑️ Scarta", key=f"scarta_bozza_{_draft_id}", use_container_width=True):
                         st.session_state["pending_google_drafts"].pop(_draft_id, None)
+                        _aggiorna_stato_bozza_email_db(_draft_id, "discarded")
                         st.rerun()
 
     user_input = st.chat_input(
@@ -3663,13 +3999,25 @@ else:
             testo_completo = testo_scritto or trascrizione_audio
 
         _file_allegati = user_input.files or []
-        _resto_addestramento = _testo_comando_addestramento(testo_completo)
-        _comando_addestramento_attivo = _resto_addestramento is not None
+
+        # Composizione email guidata a stati (round 19bis): se l'utente ha
+        # gia' una composizione in corso, QUALUNQUE messaggio arrivi ora va
+        # interpretato solo come risposta al passo corrente - ha la priorita'
+        # assoluta su addestramento/verbale/classificatore Google, cosi' il
+        # protocollo resta rigido come richiesto (l'IA non decide piu' da
+        # sola quando/se instradare la richiesta).
+        _stato_composizione_email = _leggi_stato_composizione_email(st.session_state.current_user)
+        _composizione_email_attiva = _stato_composizione_email is not None
+
+        _resto_addestramento = _testo_comando_addestramento(testo_completo) if not _composizione_email_attiva else None
+        _comando_addestramento_attivo = (not _composizione_email_attiva) and _resto_addestramento is not None
         # Creazione di un nuovo verbale audio: come l'addestramento, ha
         # sempre precedenza sul normale comando Google (calendario/posta/
         # lista spesa), perche' richiede l'audio grezzo appena registrato,
         # non solo il testo trascritto.
-        _comando_verbale_nuovo_attivo = (not _comando_addestramento_attivo) and _testo_comando_verbale_nuovo(testo_completo)
+        _comando_verbale_nuovo_attivo = (
+            (not _composizione_email_attiva) and (not _comando_addestramento_attivo) and _testo_comando_verbale_nuovo(testo_completo)
+        )
         # Il comando Google (calendario/posta/lista spesa/verbali) e'
         # controllato solo se non sono gia' attivi i due comandi sopra, per
         # evitare ambiguita' tra loro. Da questo round non e' piu' un
@@ -3678,7 +4026,7 @@ else:
         # azioni, chiedendo un chiarimento se manca un dettaglio invece di
         # indovinare - vedi _classifica_intento_google.
         _argomenti_google = None
-        if _comando_addestramento_attivo or _comando_verbale_nuovo_attivo:
+        if _composizione_email_attiva or _comando_addestramento_attivo or _comando_verbale_nuovo_attivo:
             _comando_google = None
         else:
             _tipo_intento_google, _valore_intento_google = _classifica_intento_google(
@@ -3696,7 +4044,15 @@ else:
             else:
                 _comando_google = None
 
-        if _comando_addestramento_attivo:
+        if _composizione_email_attiva:
+            # Passo corrente della macchina a stati: il testo scritto/detto
+            # ora e' SOLO la risposta alla domanda in sospeso (indirizzo,
+            # oggetto, corpo o conferma) - mai mandato al classificatore.
+            prompt = testo_completo if testo_completo else "(nessuna risposta)"
+            risposta_composizione_email = _gestisci_step_composizione_email(
+                testo_completo, st.session_state.current_user, _stato_composizione_email,
+            )
+        elif _comando_addestramento_attivo:
             # Il comando "addestramento" salva testo/file nella memoria
             # permanente invece di essere mandato all'AI come domanda normale:
             # gli allegati vanno quindi nello spazio dedicato all'addestramento,
@@ -3742,6 +4098,7 @@ else:
     else:
         prompt = None
         _input_era_vocale = False
+        _composizione_email_attiva = False
         _comando_addestramento_attivo = False
         _comando_verbale_nuovo_attivo = False
         _comando_google = None
@@ -3789,7 +4146,12 @@ else:
         with st.chat_message("assistant"):
             response = None
 
-            if _comando_addestramento_attivo:
+            if _composizione_email_attiva:
+                # Macchina a stati per l'email: la risposta al passo corrente
+                # e' gia' stata calcolata sopra, nessuna chiamata generica
+                # all'AI qui.
+                response = risposta_composizione_email
+            elif _comando_addestramento_attivo:
                 # Comando di addestramento: nessuna chiamata all'AI, si usa
                 # direttamente la conferma (o il messaggio d'errore) gia'
                 # preparata sopra durante la gestione dell'allegato/testo.
