@@ -465,10 +465,18 @@ async def cron_morning_briefing(request):
     return JSONResponse({"ok": True, "inviati": _inviati, "totale_utenti": len(_utenti)})
 
 
+async def health(request):
+    """Endpoint leggerissimo (nessuna chiamata a Google/Groq/Supabase) usato
+    dai monitor uptime esterni (es. UptimeRobot) per tenere sveglio il
+    servizio su Render free tier senza caricare la pagina Streamlit intera."""
+    return JSONResponse({"ok": True})
+
+
 app = st.App(
     "app.py",
     routes=[
         Route("/sw.js", _service_worker_endpoint, methods=["GET"]),
+        Route("/health", health, methods=["GET", "HEAD"]),
         Route("/oauth/google/start", oauth_start, methods=["GET"]),
         Route("/oauth/google/callback", oauth_callback, methods=["GET"]),
         Route("/webhook/telegram/{secret}", telegram_webhook, methods=["POST"]),
