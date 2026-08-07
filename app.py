@@ -3598,9 +3598,12 @@ if st.session_state.get("just_logged_in"):
         </script>
         """, height=0)
     _nome_utente = st.session_state.current_user.get("name", "")
+    # Il logo compare gia' in cima alla pagina (blocco CSS globale, sempre
+    # presente su ogni schermata, .carpanet-logo). Qui sotto NON va ripetuto
+    # un secondo logo: causava la "ripetizione del logo" sopra al saluto
+    # segnalata dall'utente (round 20).
     st.markdown(f"""
     <div class="carpanet-welcome">
-        <img class="carpanet-welcome-logo" src="data:image/jpeg;base64,{LOGO_B64}">
         <h1>Ciao {_nome_utente}!</h1>
         <p class="carpanet-welcome-sub">{_saluto_orario().capitalize()}! Carpanet AI e pronta ad aiutarti.</p>
     </div>
