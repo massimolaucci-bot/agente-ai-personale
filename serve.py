@@ -321,6 +321,29 @@ TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 CRON_SECRET = os.environ.get("CRON_SECRET")
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
 
+# Comandi rapidi (slash command): stessi nomi registrati nel menu "/" del bot
+# lato Telegram (vedi setMyCommands, fatto una tantum via browser durante
+# l'attivazione - non da questo codice). Ogni voce punta al nome di
+# un'azione reale gia' presente in TELEGRAM_TOOLS_SCHEMA (google_agent_core.py):
+# nessun comando qui sotto deve esistere senza una funzione vera dietro,
+# stesso principio del blocco allucinazioni gia' in uso nel resto del progetto.
+_COMANDI_RAPIDI_TELEGRAM = {
+    "/oggi": "richiedi_briefing_mattutino",
+    "/briefing": "richiedi_briefing_mattutino",
+    "/calendario": "leggi_calendario",
+    "/spesa": "lista_spesa_mostra",
+}
+_TESTO_AIUTO_TELEGRAM = (
+    "Ciao! Sono Carpanet AI, anche qui su Telegram \U0001F44B\n\n"
+    "Puoi scrivermi (anche a voce) in linguaggio naturale, es. \"aggiungi il latte alla lista della spesa\" "
+    "oppure \"cosa ho oggi?\" - oppure usare questi comandi rapidi:\n\n"
+    "/oggi - riepilogo/briefing degli impegni di oggi\n"
+    "/calendario - prossimi impegni nel calendario\n"
+    "/spesa - mostra la lista della spesa\n"
+    "/aiuto - questo messaggio\n\n"
+    "Per email e verbali audio, per ora, usa l'app web."
+)
+
 
 def _telegram_pronto():
     return bool(TELEGRAM_API_BASE and TELEGRAM_WEBHOOK_SECRET and SUPABASE_HEADERS)
@@ -436,6 +459,25 @@ async def telegram_webhook(request):
             _telegram_invia_messaggio(_chat_id, "Non sono riuscito a trascrivere il vocale: puoi riprovare o scrivere il messaggio?")
             return JSONResponse({"ok": True})
     if not _testo:
+        return JSONResponse({"ok": True})
+
+    # Comandi rapidi (slash command, registrati anche nel menu "/" del bot via
+    # setMyCommands): bypassano il classificatore Groq per velocita' e
+    # affidabilita' su queste poche azioni note, invece di passare sempre dal
+    # riconoscimento in linguaggio naturale.
+    _comando_rapido = _testo.split()[0].lower().split("@")[0] if _testo.startswith("/") else None
+    if _comando_rapido in _COMANDI_RAPIDI_TELEGRAM:
+        try:
+            _risposta = gac._handle_google_agent_logic_telegram(
+                _COMANDI_RAPIDI_TELEGRAM[_comando_rapido], {}, _utente, _testo,
+            )
+        except Exception as e:
+            print(f"[telegram] comando rapido fallito: {e}", flush=True)
+            _risposta = "Mi dispiace, si e' verificato un errore: riprova tra poco."
+        _telegram_invia_messaggio(_chat_id, _risposta or "Non ho una risposta per questo, mi dispiace.")
+        return JSONResponse({"ok": True})
+    if _comando_rapido in ("/start", "/aiuto", "/help"):
+        _telegram_invia_messaggio(_chat_id, _TESTO_AIUTO_TELEGRAM)
         return JSONResponse({"ok": True})
 
     try:
