@@ -2378,6 +2378,25 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
 
 st.set_page_config(page_title="Carpanet AI", page_icon="static/icon-192.png", layout="centered")
 
+# --- [TEST RESTYLING] Login "glassmorphism" --------------------------------
+# Sfondo generale (gradient scuro/blu notte) e stile base della card del
+# form, condivisi da entrambe le schermate di login (bootstrap/esistente).
+# Il restringimento della card a larghezza "login" (vs. gli 820px usati per
+# la chat) NON viene fatto qui, ma piu' sotto, dentro il ramo che disegna
+# davvero il login (vedi nota li' per il motivo). Non tocca la logica, solo
+# l'aspetto. Se in futuro si decide di tenerlo, andra' portato anche nella
+# app di produzione insieme a questa modifica.
+st.markdown("""
+<style>
+[data-testid="stAppViewContainer"] {
+    background: radial-gradient(circle at 50% 0%, #142240 0%, #0a0e17 55%, #05070d 100%);
+}
+[data-testid="stHeader"] {
+    background: transparent;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # --- PWA: installazione come app sulla schermata Home -----------------------
 # IMPORTANTE: un <script> inserito tramite st.markdown(unsafe_allow_html=True)
 # NON viene mai eseguito dal browser (i tag <script> impostati via innerHTML
@@ -3079,15 +3098,135 @@ if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
     """, height=0)
 
 if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
-    st.markdown("## AI privata")
+    # --- [TEST RESTYLING] Card di login, versione raffinata -----------------
+    # Selettori verificati con Playwright direttamente sul DOM reale di questa
+    # versione di Streamlit (1.60.0), NON copiati alla cieca dal riferimento
+    # di Qwen:
+    #  - ".block-container" esiste davvero (verificato: count=1) ed e' la
+    #    stessa classe gia' usata piu' sotto per la larghezza della chat;
+    #    "[data-testid='stAppViewBlockContainer']" invece NON esiste in
+    #    questa versione (count=0), quindi non va usato.
+    #  - Il bottone di submit del form NON e' raggiungibile con
+    #    ".stFormSubmit > button" (selettore proposto da Qwen, verificato
+    #    assente: count=0) ma con "[data-testid='stForm']
+    #    button[kind='secondaryFormSubmit']" (gia' in uso qui sotto),
+    #    trovato ispezionando l'outerHTML reale del bottone.
+    #  - Il campo "Chi sei?" NON e' un vecchio selectbox BaseWeb
+    #    (div[data-baseweb="select"] non esiste piu' in questa versione,
+    #    sostituito da un componente react-aria): il PIN e il nome restano
+    #    semplici <input type="text"|"password">, quindi li stiliamo
+    #    direttamente cosi', senza selettori BaseWeb ormai obsoleti.
+    #
+    # Questo blocco e' iniettato SOLO qui, dentro la schermata di login,
+    # cioe' DOPO (nell'ordine della pagina) il grande blocco CSS piu' sopra
+    # che fissa ".block-container" a 820px per la chat: essendo posizionato
+    # dopo, questa regola (stessa specificita', anch'essa !important) vince
+    # per ordine di sorgente e restringe la card SOLO in questa schermata,
+    # senza toccare la larghezza della chat vera.
+    st.markdown("""
+<style>
+.block-container {
+    max-width: 440px !important;
+    margin-top: 6vh !important;
+    padding: 2.25rem 2rem 1.75rem 2rem !important;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 24px;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 15px 40px rgba(0,0,0,0.55), 0 0 24px rgba(0,229,255,0.06);
+}
+@media (max-width: 480px) {
+    .block-container {
+        max-width: 92vw !important;
+        margin-top: 4vh !important;
+        padding: 1.75rem 1.25rem !important;
+    }
+}
+/* Il form era gia' una "card" a se stante nella versione precedente: ora che
+   la card e' l'intero .block-container, il form diventa trasparente per non
+   avere una card dentro l'altra. */
+[data-testid="stForm"] {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+    padding: 0.25rem 0 0 0 !important;
+}
+/* "Orb" luminoso: solo bagliore/glow (nessun logo dentro), come da v2
+   approvata. Sfera con gradiente radiale che simula una luce ciano che
+   "respira" cambiando leggermente scala. */
+.carpanet-orb {
+    width: 90px; height: 90px; border-radius: 50%;
+    margin: 0 auto 14px auto;
+    background: radial-gradient(circle at 35% 30%, rgba(255,255,255,.95), rgba(0,242,254,.5) 35%, rgba(8,15,28,.95) 75%);
+    box-shadow: 0 0 30px rgba(0,229,255,.45), inset 0 0 18px rgba(0,0,0,.5);
+    animation: carpanet-breathe 3.4s ease-in-out infinite;
+}
+@keyframes carpanet-breathe {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.08); }
+}
+.carpanet-login-title { text-align: center; margin: 0 0 0.35rem 0; }
+.carpanet-login-sub { text-align: center; color: #9fb3d1; margin-bottom: 1.1rem; }
+
+/* Campi di testo (nome, PIN, e l'input testuale del "Chi sei?"): sfondo
+   scuro coerente con la card, stesso trattamento per tutti e tre perche'
+   sono tutti <input type="text"|"password"> nel DOM reale. */
+[data-testid="stForm"] input[type="text"],
+[data-testid="stForm"] input[type="password"] {
+    background-color: rgba(0,0,0,0.3) !important;
+    border: 1px solid rgba(255,255,255,0.15) !important;
+    border-radius: 12px !important;
+    color: #ffffff !important;
+    padding: 12px !important;
+}
+/* Il PIN, in stile "tastierino": font piu' grande, cifre distanziate,
+   centrate. Colpisce SOLO input[type="password"] (il PIN), non il nome ne'
+   il campo "Chi sei?", che restano a lettura normale. */
+[data-testid="stForm"] input[type="password"] {
+    font-size: 22px !important;
+    letter-spacing: 8px !important;
+    text-align: center !important;
+}
+[data-testid="stForm"] input[type="text"]:focus,
+[data-testid="stForm"] input[type="password"]:focus {
+    border-color: #00e5ff !important;
+    box-shadow: 0 0 0 1px #00e5ff, 0 0 15px rgba(0,229,255,0.25) !important;
+    outline: none !important;
+}
+/* Pulsante di submit: gradient dal blu elettrico al ciano (selettore
+   verificato sopra: kind="secondaryFormSubmit" e' quello vero). */
+[data-testid="stForm"] button[kind="secondaryFormSubmit"],
+[data-testid="stForm"] button[kind="formSubmit"] {
+    background: linear-gradient(90deg, #2b6cff 0%, #00e5ff 100%) !important;
+    border: none !important;
+    color: #04121a !important;
+    font-weight: 700 !important;
+    width: 100% !important;
+    box-shadow: 0 0 16px rgba(0, 229, 255, 0.35);
+    transition: filter 0.15s ease, transform 0.15s ease;
+}
+[data-testid="stForm"] button[kind="secondaryFormSubmit"]:hover,
+[data-testid="stForm"] button[kind="formSubmit"]:hover {
+    filter: brightness(1.1);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 20px rgba(0, 229, 255, 0.4);
+}
+[data-testid="stForm"] .stCheckbox { margin-top: 0.5rem; }
+</style>
+<div class="carpanet-orb"></div>
+""", unsafe_allow_html=True)
+    st.markdown('<h2 class="carpanet-login-title">Accesso Sicuro</h2>', unsafe_allow_html=True)
+    st.markdown('<p class="carpanet-login-sub">Benvenuto nel tuo Agente AI Vocale.</p>', unsafe_allow_html=True)
     existing_users = _load_family_users()
     if not existing_users:
-        st.info("Nessun account ancora creato. Crea il primo account (genitore) per iniziare.")
+        st.info("Nessun account ancora creato. Crea il primo account (genitore) per iniziare a usare il tuo Agente AI Vocale.")
         with st.form("bootstrap_parent_form"):
             new_name = st.text_input("Il tuo nome")
             new_pin = st.text_input("Scegli un PIN (4-6 cifre)", type="password")
             new_ricordami = st.checkbox("Ricordami su questo dispositivo (non richiedere piu' il PIN)")
-            submitted = st.form_submit_button("Crea account genitore")
+            submitted = st.form_submit_button("Crea il mio Assistente")
             if submitted:
                 if new_name.strip() and new_pin.strip():
                     _nuovo = _create_family_user(new_name.strip(), new_pin.strip(), "genitore")
@@ -3107,9 +3246,9 @@ if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
         names = [u["name"] for u in existing_users]
         with st.form("login_form"):
             selected_name = st.selectbox("Chi sei?", names)
-            pin_input = st.text_input("PIN", type="password")
+            pin_input = st.text_input("PIN", type="password", placeholder="Il tuo PIN a 4-6 cifre")
             ricordami = st.checkbox("Ricordami su questo dispositivo (non richiedere piu' il PIN)")
-            submitted = st.form_submit_button("Accedi")
+            submitted = st.form_submit_button("Sblocca Assistente")
             if submitted:
                 user = _verify_family_login(selected_name, pin_input)
                 if user:
@@ -3121,7 +3260,7 @@ if MEMORIA_PERSISTENTE and st.session_state.current_user is None:
                             st.session_state["_remember_token_to_store"] = _tok
                     st.rerun()
                 else:
-                    st.error("PIN errato.")
+                    st.error("PIN errato. Riprova, per favore.")
     st.stop()
 elif st.session_state.current_user is None:
     # Memoria persistente non configurata: nessun posto sicuro per gli account,
