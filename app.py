@@ -29,7 +29,13 @@ MAX_MESSAGE_CHARS = 1500    # lunghezza massima di un singolo messaggio inviato 
 MAX_SAVED_MESSAGES = 200    # quante battute tenere salvate su disco per la visualizzazione
 
 PRIMARY_MODEL = "groq/compound"
-FALLBACK_MODEL = "llama-3.3-70b-versatile"
+# Round 20bis: "llama-3.3-70b-versatile" viene dismesso da Groq il 16/08/2026
+# (piano free/developer - vedi https://console.groq.com/docs/deprecations).
+# Sostituito con "openai/gpt-oss-120b", il primo dei due rimpiazzi
+# consigliati ufficialmente da Groq per questo identico modello, con
+# supporto pieno al tool/function calling (necessario per tutte le azioni
+# reali: calendario, lista spesa, email, verbali) come il modello precedente.
+FALLBACK_MODEL = "openai/gpt-oss-120b"
 PRIMARY_MAX_TOKENS = 900
 FALLBACK_MAX_TOKENS = 500
 
@@ -2055,9 +2061,10 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
       configurato, o la chiamata a Groq e' fallita: in ogni caso il chiamante
       deve lasciar fluire il messaggio alla chat generica come se questo
       controllo non fosse mai avvenuto.
-    Usa FALLBACK_MODEL (llama-3.3-70b-versatile), modello Groq con supporto
-    affidabile per i tool personalizzati - non PRIMARY_MODEL ("groq/compound"),
-    il cui comportamento con "tools" definiti da noi non e' documentato."""
+    Usa FALLBACK_MODEL ("openai/gpt-oss-120b", round 20bis: rimpiazza il
+    dismesso llama-3.3-70b-versatile), modello Groq con supporto affidabile
+    per i tool personalizzati - non PRIMARY_MODEL ("groq/compound"), il cui
+    comportamento con "tools" definiti da noi non e' documentato."""
     if not _google_oauth_enabled():
         return ("NESSUNA", None)
 

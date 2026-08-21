@@ -56,7 +56,13 @@ from googleapiclient.discovery import build as google_build
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 PRIMARY_MODEL = "groq/compound"
-FALLBACK_MODEL = "llama-3.3-70b-versatile"
+# Round 20bis: "llama-3.3-70b-versatile" viene dismesso da Groq il 16/08/2026
+# (piano free/developer - vedi https://console.groq.com/docs/deprecations).
+# Sostituito con "openai/gpt-oss-120b", il primo dei due rimpiazzi
+# consigliati ufficialmente da Groq per questo identico modello, con
+# supporto pieno al tool/function calling (necessario per la classificazione
+# intenti Telegram e tutte le azioni reali) come il modello precedente.
+FALLBACK_MODEL = "openai/gpt-oss-120b"
 FALLBACK_MAX_TOKENS = 500
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
