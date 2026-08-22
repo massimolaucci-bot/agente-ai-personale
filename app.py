@@ -2621,7 +2621,7 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
     return "Ho capito cosa intendi ma non sono riuscito a portarlo a termine: puoi riprovare?"
 
 
-def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None, location_text=None, current_user_name=None):
+def build_api_messages(history, knowledge_text, history_limit=None, char_limit=None, location_text=None, current_user_name=None, documenti_correnti=None):
     history_limit = history_limit or MAX_HISTORY_MESSAGES
     char_limit = char_limit or MAX_MESSAGE_CHARS
 
@@ -2671,6 +2671,20 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
             "in caso di conflitto vince sempre la regola sulle capacita' reali.\n"
             + knowledge_text.strip()
         )
+
+    # Documento/i allegato/i ORA, nel messaggio corrente (round 20ter): a
+    # differenza dei documenti di "addestramento" qui sotto (permanenti,
+    # cercati per rilevanza), questo e' il contenuto letto al volo da un PDF/
+    # Word/testo trascinato nella chat, da usare subito per rispondere -
+    # bug segnalato dall'utente: prima veniva solo salvato un link, mai letto
+    # davvero, quindi l'IA diceva correttamente (ma inutilmente) di non poter
+    # leggere il documento. Iniettato per intero (fino al limite sotto) nel
+    # prompt di sistema, cosi' NON e' soggetto al taglio a MAX_MESSAGE_CHARS
+    # applicato piu' sotto alla cronologia dei messaggi.
+    if documenti_correnti:
+        system_prompt += "\n\nDocumento/i appena allegato/i dall'utente in questo messaggio (leggili e usali per rispondere):\n"
+        for _nome_doc, _testo_doc in documenti_correnti:
+            system_prompt += f"\n--- Da '{_nome_doc}' ---\n{_testo_doc}\n"
 
     # Documenti di addestramento (PDF/Word) caricati dall'utente: cerca i
     # passaggi piu' pertinenti rispetto all'ultima domanda e li aggiunge come
@@ -4009,6 +4023,12 @@ else:
             testo_completo = testo_scritto or trascrizione_audio
 
         _file_allegati = user_input.files or []
+        # Testo dei documenti allegati ORA e letti con successo (round
+        # 20ter): lista di tuple (nome, testo), popolata solo nel ramo della
+        # chat generica sotto. Inizializzata qui cosi' e' sempre definita,
+        # qualunque ramo (email/addestramento/verbale/comando Google) venga
+        # preso per questo messaggio.
+        _testi_allegati_correnti = []
 
         # Composizione email guidata a stati (round 19bis): se l'utente ha
         # gia' una composizione in corso, QUALUNQUE messaggio arrivi ora va
@@ -4093,10 +4113,45 @@ else:
             notes = []
             if _audio_non_trascritto:
                 notes.append("[Audio ricevuto ma non e stato possibile trascriverlo]")
+            # Bug segnalato dall'utente (round 20ter): un PDF/Word/testo
+            # trascinato nella chat normale veniva solo caricato su R2 e
+            # citato con un link nella nota - MAI letto davvero, quindi l'IA
+            # rispondeva (correttamente, ma in modo inutile) di non poter
+            # leggere il documento. Ora, per le estensioni con estrazione
+            # testo disponibile, il contenuto viene estratto qui e passato a
+            # build_api_messages perche' l'AI lo legga per davvero in questa
+            # stessa risposta (vedi _testi_allegati_correnti sotto).
+            _ESTENSIONI_TESTO_ALLEGATI = (".pdf", ".doc", ".docx", ".txt")
             for f in _file_allegati:
                 file_bytes = f.getvalue()
                 r2_link = r2_upload(file_bytes, f.name, R2_BUCKET_ALLEGATI, R2_PUBLIC_URL_ALLEGATI)
-                if r2_link is not None:
+                _estensione_allegato = os.path.splitext(f.name)[1].lower()
+                _testo_allegato = ""
+                if _estensione_allegato == ".pdf":
+                    _testo_allegato = _extract_pdf_text(file_bytes)
+                elif _estensione_allegato in (".doc", ".docx"):
+                    _testo_allegato = _extract_docx_text(file_bytes)
+                elif _estensione_allegato == ".txt":
+                    try:
+                        _testo_allegato = file_bytes.decode("utf-8", errors="replace").strip()
+                    except Exception:
+                        _testo_allegato = ""
+
+                if _testo_allegato:
+                    # Limite generoso (alcune pagine): la lista dei documenti
+                    # correnti va nel prompt di sistema, non nella cronologia,
+                    # quindi non e' soggetta al taglio a MAX_MESSAGE_CHARS.
+                    _testi_allegati_correnti.append((f.name, _testo_allegato[:15000]))
+                    if r2_link is not None:
+                        notes.append(f"[Documento allegato e letto: {f.name} ({r2_link})]")
+                    else:
+                        notes.append(f"[Documento allegato e letto: {f.name}]")
+                elif _estensione_allegato in _ESTENSIONI_TESTO_ALLEGATI:
+                    if r2_link is not None:
+                        notes.append(f"[Allegato salvato: {f.name} ({r2_link}) — non sono riuscito a estrarne il testo, forse e' un PDF scansionato senza testo selezionabile]")
+                    else:
+                        notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche lo spazio di archiviazione non e ancora configurato o non e raggiungibile, e non sono riuscito a estrarne il testo]")
+                elif r2_link is not None:
                     notes.append(f"[Allegato salvato: {f.name} ({r2_link})]")
                 else:
                     notes.append(f"[Allegato ricevuto: {f.name} — non salvato in modo permanente perche lo spazio di archiviazione non e ancora configurato o non e raggiungibile]")
@@ -4113,6 +4168,7 @@ else:
         _comando_verbale_nuovo_attivo = False
         _comando_google = None
         _argomenti_google = None
+        _testi_allegati_correnti = []
 
     # Ora che sappiamo se in questo giro arriva anche una risposta nuova,
     # possiamo riempire (o lasciare vuoto) il segnaposto del pulsante 🔊
@@ -4197,6 +4253,7 @@ else:
                         st.session_state.get("knowledge_text", ""),
                         location_text=st.session_state.get("user_location"),
                         current_user_name=st.session_state.current_user.get("name"),
+                        documenti_correnti=_testi_allegati_correnti,
                     )
                     completion = client.chat.completions.create(
                         model=PRIMARY_MODEL,
