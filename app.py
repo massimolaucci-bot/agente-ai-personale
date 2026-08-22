@@ -1174,9 +1174,19 @@ def _get_google_credentials(conn_type, user_id=None):
         try:
             creds.refresh(GoogleAuthRequest())
             _nuova_scadenza = (creds.expiry.isoformat() + "Z") if creds.expiry else None
+            # BUG CORRETTO (round 20quater): vedi commento identico nella
+            # funzione gemella _get_google_credentials in google_agent_core.py.
+            # creds.scopes e' sempre la lista statica GOOGLE_OAUTH_SCOPES (il
+            # "desiderio" dell'app), MAI cio' che Google ha davvero concesso:
+            # ogni refresh silenzioso sovrascriveva "scope" con l'elenco
+            # completo, disattivando di fatto l'avviso "permesso mancante,
+            # ricollega" dopo il primo refresh (entro un'ora dal collegamento),
+            # anche quando l'API rifiutava davvero la richiesta (403). Un
+            # refresh non puo' mai ampliare lo scope concesso: corretto per
+            # non toccarlo, riscrivendo il valore gia' salvato.
             _save_google_tokens(
                 conn_type, user_id, creds.token, None, _nuova_scadenza,
-                " ".join(creds.scopes) if creds.scopes else tokens.get("scope"),
+                tokens.get("scope"),
             )
         except Exception:
             return None

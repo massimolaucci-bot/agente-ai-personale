@@ -228,9 +228,25 @@ def _get_google_credentials(conn_type, user_id=None):
         try:
             creds.refresh(GoogleAuthRequest())
             _nuova_scadenza = (creds.expiry.isoformat() + "Z") if creds.expiry else None
+            # BUG CORRETTO (round 20quater): qui PRIMA si salvava
+            # " ".join(creds.scopes), ma creds.scopes e' sempre la lista
+            # statica GOOGLE_OAUTH_SCOPES passata a Credentials() sopra (il
+            # "desiderio" dell'app), MAI cio' che Google ha davvero concesso
+            # al momento del consenso originale - quindi era sempre vera
+            # (creds.scopes else ... non scattava mai) e ogni refresh
+            # silenzioso del token SOVRASCRIVEVA la colonna "scope" con
+            # l'elenco completo, anche se l'utente aveva autorizzato un
+            # permesso piu' stretto. Risultato concreto: l'avviso "permesso
+            # mancante, ricollega" nella sezione "Collegamenti Google"
+            # smetteva di funzionare dopo il primo refresh automatico
+            # (entro un'ora), anche quando l'API di Google rifiutava
+            # davvero la richiesta (403 insufficient scope). Un refresh non
+            # puo' MAI ampliare lo scope concesso: la scelta corretta e'
+            # non toccarlo affatto, riscrivendo lo stesso valore gia'
+            # salvato in precedenza.
             _save_google_tokens(
                 conn_type, user_id, creds.token, None, _nuova_scadenza,
-                " ".join(creds.scopes) if creds.scopes else tokens.get("scope"),
+                tokens.get("scope"),
             )
         except Exception:
             return None
