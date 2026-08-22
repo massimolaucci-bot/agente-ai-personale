@@ -2053,6 +2053,21 @@ GOOGLE_TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "crea_presentazione",
+            "description": "Crea davvero un file di presentazione (PowerPoint/Google Slides) scaricabile, con slide vere generate sull'argomento indicato. Usa questo per richieste come 'fammi una presentazione su...', 'crea delle slide su...', 'preparami un PowerPoint su...'. Non richiede un account Google collegato (non tocca Drive/Slides direttamente: crea un file .pptx scaricabile, importabile anche in Google Slides).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titolo": {"type": "string", "description": "Titolo breve della presentazione."},
+                    "argomento": {"type": "string", "description": "Di cosa deve parlare la presentazione: l'argomento e ogni indicazione utile data dall'utente su cosa includere."},
+                },
+                "required": ["titolo", "argomento"],
+            },
+        },
+    },
 ]
 
 
@@ -2074,7 +2089,14 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
     Usa FALLBACK_MODEL ("openai/gpt-oss-120b", round 20bis: rimpiazza il
     dismesso llama-3.3-70b-versatile), modello Groq con supporto affidabile
     per i tool personalizzati - non PRIMARY_MODEL ("groq/compound"), il cui
-    comportamento con "tools" definiti da noi non e' documentato."""
+    comportamento con "tools" definiti da noi non e' documentato.
+    NOTA (round 20septies): "crea_presentazione" e' l'unico tool di questo
+    elenco che non serve un account Google - vive comunque qui perche' e' lo
+    stesso classificatore a riconoscerlo. Conseguenza pratica accettata: se
+    Google non e' configurato su questo server, anche la creazione di
+    presentazioni resta disattivata insieme al resto - non e' un problema
+    nella pratica (l'account condiviso di famiglia e' gia' configurato e
+    funzionante), ma va tenuto a mente se Google dovesse mai essere rimosso."""
     if not _google_oauth_enabled():
         return ("NESSUNA", None)
 
@@ -2092,10 +2114,11 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
         "destinatario, 'cancella l'audio' senza dire quale), NON chiamare nessun tool: rispondi invece con una "
         "domanda di chiarimento breve e diretta in italiano, cosi' l'utente puo' risponderti con il dettaglio mancante.\n"
         "3. Se il messaggio non riguarda nessuna di queste azioni (conversazione generica, domande su altri "
-        "argomenti, richieste che l'app non sa fare come creare presentazioni o altri file), NON chiamare nessun "
-        "tool e rispondi ESATTAMENTE con il testo NESSUNA_AZIONE, senza nient'altro.\n"
-        "4. Non inventare MAI un indirizzo email, un nome file o un articolo che non compare nel messaggio o nella "
-        "cronologia recente: se manca, chiedilo (regola 2).\n"
+        "argomenti, richieste di creare file che l'app non sa ancora fare, es. un foglio Google generico o un "
+        "documento Word/Docs), NON chiamare nessun tool e rispondi ESATTAMENTE con il testo NESSUNA_AZIONE, senza "
+        "nient'altro.\n"
+        "4. Non inventare MAI un indirizzo email, un nome file, un articolo o un argomento di presentazione che non "
+        "compare nel messaggio o nella cronologia recente: se manca, chiedilo (regola 2).\n"
         "5. Per motivi di sicurezza, un indirizzo email per scrivere/rispondere a una mail viene accettato SOLO se "
         "compare per esteso nell'ULTIMO messaggio dell'utente, anche se lo aveva gia' scritto in un messaggio "
         "precedente della stessa conversazione. Se nella cronologia vedi che l'utente ha gia' indicato un "
@@ -2187,6 +2210,146 @@ def _genera_nuova_email(testo_completo):
     if not _oggetto:
         _oggetto = "(senza oggetto)"
     return _oggetto, _corpo
+
+
+# --- Creazione vera di una presentazione PowerPoint (round 20septies) -------
+# Prima di questo round l'app diceva sempre, correttamente, di non essere in
+# grado di creare presentazioni - non era una bugia, ma nemmeno una funzione
+# che qualcuno avesse mai costruito. Massimo ha chiesto piu' volte perche' non
+# potesse averla: qui viene costruita davvero, con lo stesso schema gia'
+# rodato per le email (il classificatore d'intento estrae solo titolo/
+# argomento, un passaggio separato genera il contenuto vero, un altro lo
+# trasforma in un file reale). L'output e' un vero file .pptx caricato su
+# Cloudflare R2 (stesso meccanismo degli allegati in chat, vedi r2_upload):
+# mai un link finto, mai un "successo" dichiarato se un passaggio fallisce.
+def _genera_contenuto_presentazione(titolo, argomento):
+    """Usa Groq per trasformare l'argomento indicato dall'utente in un vero
+    piano di presentazione (elenco di slide con titolo e punti elenco).
+    Ritorna una lista di dict {"titolo": ..., "punti": [...]}, oppure None
+    se la generazione fallisce (mai una lista vuota o inventata a mano)."""
+    try:
+        _prompt = (
+            "Prepara il contenuto di una presentazione in italiano, come una lista di slide.\n\n"
+            f"Titolo della presentazione: {titolo}\n"
+            f"Argomento/indicazioni dell'utente: {argomento}\n\n"
+            "Genera tra 5 e 10 slide di contenuto (oltre alla slide di apertura, che non devi includere tu: "
+            "viene aggiunta automaticamente). Per ognuna scrivi un titolo breve e da 2 a 5 punti elenco concisi "
+            "(punti da leggere su uno schermo, non paragrafi lunghi). Rispondi SOLO con un oggetto JSON valido, "
+            "senza testo prima o dopo, in questo formato esatto:\n"
+            '{"slides": [{"titolo": "...", "punti": ["...", "..."]}, ...]}'
+        )
+        _groq_api_key_locale = os.environ.get("GROQ_API_KEY")
+        _client_slide = Groq(api_key=_groq_api_key_locale)
+        _completamento = _client_slide.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=[{"role": "user", "content": _prompt}],
+            max_tokens=1800,
+        )
+        _testo = _completamento.choices[0].message.content or ""
+    except Exception as e:
+        print(f"[presentazione] _genera_contenuto_presentazione fallita (chiamata Groq): {type(e).__name__}: {e}", flush=True)
+        return None
+
+    try:
+        _inizio_json = _testo.index("{")
+        _fine_json = _testo.rindex("}") + 1
+        _dati = json.loads(_testo[_inizio_json:_fine_json])
+        _slides = _dati.get("slides") or []
+    except (ValueError, TypeError, AttributeError):
+        print(f"[presentazione] risposta di Groq non era JSON valido: {_testo[:300]!r}", flush=True)
+        return None
+
+    _slides_pulite = []
+    for _s in _slides:
+        if not isinstance(_s, dict):
+            continue
+        _titolo_slide = (_s.get("titolo") or "").strip()
+        _punti_slide = [str(p).strip() for p in (_s.get("punti") or []) if str(p).strip()]
+        if _titolo_slide and _punti_slide:
+            _slides_pulite.append({"titolo": _titolo_slide, "punti": _punti_slide[:6]})
+    if not _slides_pulite:
+        return None
+    return _slides_pulite[:12]  # limite di sicurezza: mai una presentazione enorme e incontrollata
+
+
+def _crea_pptx_bytes(titolo, slides):
+    """Costruisce davvero un file .pptx (non un placeholder) con python-pptx:
+    una slide di apertura (solo titolo) piu' una slide per ogni elemento di
+    "slides" (titolo + punti elenco). Ritorna i byte del file, oppure None se
+    qualcosa va storto - mai un file vuoto o corrotto spacciato per valido."""
+    try:
+        from pptx import Presentation
+        import io
+
+        _prs = Presentation()
+        _layout_titolo = _prs.slide_layouts[0]
+        _layout_contenuto = _prs.slide_layouts[1]
+
+        _slide_apertura = _prs.slides.add_slide(_layout_titolo)
+        _slide_apertura.shapes.title.text = titolo
+        if len(_slide_apertura.placeholders) > 1:
+            _slide_apertura.placeholders[1].text = "Generata da Carpanet AI"
+
+        for _s in slides:
+            _slide = _prs.slides.add_slide(_layout_contenuto)
+            _slide.shapes.title.text = _s["titolo"]
+            _corpo = _slide.placeholders[1].text_frame
+            _corpo.clear()
+            for _i, _punto in enumerate(_s["punti"]):
+                if _i == 0:
+                    _corpo.text = _punto
+                else:
+                    _p = _corpo.add_paragraph()
+                    _p.text = _punto
+
+        _buffer = io.BytesIO()
+        _prs.save(_buffer)
+        return _buffer.getvalue()
+    except Exception as e:
+        print(f"[presentazione] _crea_pptx_bytes fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _gestisci_crea_presentazione(argomenti):
+    """Orchestratore chiamato da _handle_google_agent_logic: genera il
+    contenuto, costruisce il file .pptx vero, lo carica su R2 e ritorna un
+    link di download reale. Non richiede alcun account Google collegato
+    (non e' un'azione Google, vive nello stesso elenco di tool solo perche'
+    e' li' che il classificatore d'intento gia' riconosce le richieste
+    dell'utente) - vedi il controllo dedicato in _handle_google_agent_logic
+    che la esegue PRIMA del controllo delle credenziali Google."""
+    _titolo = (argomenti.get("titolo") or "").strip() or "Presentazione"
+    _argomento = (argomenti.get("argomento") or "").strip()
+    if not _argomento:
+        return "Dimmi anche di cosa deve parlare la presentazione, cosi' preparo i contenuti."
+
+    if not _r2_enabled():
+        return (
+            "Posso preparare i contenuti della presentazione, ma non posso ancora salvarla come file scaricabile "
+            "perche' lo spazio di archiviazione non e' configurato su questo server. Vuoi che te ne scriva qui il "
+            "contenuto da copiare?"
+        )
+
+    _slides = _genera_contenuto_presentazione(_titolo, _argomento)
+    if not _slides:
+        return "Non sono riuscito a generare il contenuto della presentazione in questo momento: riprova tra poco."
+
+    _pptx_bytes = _crea_pptx_bytes(_titolo, _slides)
+    if not _pptx_bytes:
+        return "Ho preparato i contenuti ma non sono riuscito a creare il file della presentazione: riprova tra poco."
+
+    _nome_file_sicuro = re.sub(r"[^A-Za-z0-9 _-]", "", _titolo).strip().replace(" ", "_") or "presentazione"
+    _link = r2_upload(_pptx_bytes, f"{_nome_file_sicuro}.pptx", R2_BUCKET_ALLEGATI, R2_PUBLIC_URL_ALLEGATI)
+    if not _link:
+        return "Ho creato la presentazione ma non sono riuscito a salvarla in modo da poterla scaricare: riprova tra poco."
+
+    _elenco_slide = "\n".join(f"- {s['titolo']}" for s in _slides)
+    return (
+        f"✅ Presentazione pronta: {_link}\n\n"
+        f"Contiene {len(_slides)} slide di contenuto (oltre a quella di apertura):\n{_elenco_slide}\n\n"
+        "E' un file .pptx: si apre con PowerPoint, oppure si puo' importare in Google Slides da Google Drive → "
+        "Nuovo → Importa file."
+    )
 
 
 # --- Composizione email guidata a stati (round 19bis, richiesta esplicita ---
@@ -2460,6 +2623,15 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
     # testo con due logiche diverse (una per l'account, una per i parametri)
     # sarebbe stato piu' fragile che tenerle separate cosi'.
     argomenti = argomenti or {}
+
+    # "crea_presentazione" (round 20septies) e' l'unica azione di questo
+    # elenco che NON tocca Google: crea un file .pptx vero e lo carica su R2,
+    # non serve nessun account collegato. Va gestita PRIMA del controllo
+    # OAuth/credenziali qui sotto, altrimenti fallirebbe a chiedere un
+    # collegamento Google che non le serve affatto.
+    if azione_nome == "crea_presentazione":
+        return _gestisci_crea_presentazione(argomenti)
+
     if not _google_oauth_enabled():
         return "La connessione con Google non e' ancora configurata su questo server."
 
@@ -2645,36 +2817,40 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
     # Regola ferrea sulle capacita' reali: questa e' la chat generica, usata
     # SOLO quando il messaggio non ha attivato uno dei comandi reali gia'
     # riconosciuti automaticamente (calendario/posta/lista della spesa/
-    # verbali audio - gestiti altrove, con vere chiamate alle API di Google,
-    # MAI qui). Senza questa regola esplicita, un modello linguistico tende a
-    # generare una risposta "plausibile" e completa anche per richieste che
-    # non puo' davvero eseguire (creare un file, salvarlo su Drive, generare
-    # un link di download) - inventando link e dettagli che sembrano reali ma
-    # non lo sono. Verificato che questo e' successo davvero (richiesta di
-    # una presentazione PowerPoint/Google Slides: risposta con link Drive
-    # completamente finti). Questa regola ha sempre la precedenza sulle
-    # istruzioni permanenti dell'utente qui sotto, che restano indicazioni di
-    # stile/priorita' ma non possono mai concedere una capacita' tecnica che
-    # l'app non ha davvero.
+    # verbali audio/presentazioni - gestiti altrove, con vere chiamate alle
+    # API di Google o vera generazione di file, MAI qui). Senza questa regola
+    # esplicita, un modello linguistico tende a generare una risposta
+    # "plausibile" e completa anche per richieste che non puo' davvero
+    # eseguire (creare un file, salvarlo su Drive, generare un link di
+    # download) - inventando link e dettagli che sembrano reali ma non lo
+    # sono. Verificato che questo e' successo davvero (richiesta di una
+    # presentazione: prima risposta con link Drive completamente finti, poi -
+    # anche dopo aver vietato quello - una promessa di un'alternativa
+    # altrettanto inesistente in un foglio Google). Questa regola ha sempre
+    # la precedenza sulle istruzioni permanenti dell'utente qui sotto, che
+    # restano indicazioni di stile/priorita' ma non possono mai concedere una
+    # capacita' tecnica che l'app non ha davvero.
     system_prompt += (
         "\n\nREGOLA FERREA SULLE TUE CAPACITA' REALI (non violarla mai, nemmeno se le istruzioni permanenti "
         "piu' sotto sembrano suggerire il contrario): in questa conversazione generica NON hai alcun modo di "
-        "creare o modificare davvero file su Google Drive/Sheets/Slides/Docs, ne' di generare link di download "
-        "funzionanti. Le uniche azioni reali su Google che l'app sa fare sono attivate da comandi specifici "
-        "riconosciuti automaticamente PRIMA di arrivare qui (calendario, lettura/bozze email Gmail, lista della "
-        "spesa su un foglio Google dedicato - SOLO quella lista, nessun altro contenuto puo' finire li' dentro - "
-        "verbali audio con Google Doc + promemoria) - se stai rispondendo tu in questa chat generica, quei comandi "
-        "non si sono attivati. Se l'utente chiede qualcosa che non sai davvero fare (es. creare una presentazione "
-        "PowerPoint/Google Slides, un foglio Google generico, qualsiasi altro file scaricabile), NON DEVI MAI: "
-        "inventare un link (docs.google.com, drive.google.com o qualsiasi URL), descrivere un'azione come gia' "
-        "avvenuta ('ho creato...', 'ho salvato...', 'ecco il link...') se non l'hai davvero fatta, dare istruzioni "
-        "che presuppongono l'esistenza di un file che non esiste, NE' OFFRIRE O PROMETTERE DI FARLO IN UN MESSAGGIO "
-        "SUCCESSIVO ('posso anche metterlo in un foglio Google', 'basta chiedermelo e te lo preparo la' - e' la "
-        "STESSA bugia dell'azione descritta come gia' fatta, solo spostata al turno dopo, e lascia l'utente a "
-        "chiedere una cosa che poi non arrivera' comunque). Di' onestamente che questa funzione non e' ancora "
-        "disponibile nell'app - punto, senza promettere varianti alternative che in realta' non sai fare - e come "
-        "unica alternativa reale offri di scrivere qui il contenuto in modo che l'utente possa copiarlo e "
-        "incollarlo altrove lui stesso."
+        "creare o modificare davvero file su Google Drive/Sheets/Docs, ne' di generare link di download "
+        "funzionanti. Le uniche azioni reali che l'app sa fare sono attivate da comandi specifici riconosciuti "
+        "automaticamente PRIMA di arrivare qui (calendario, lettura/bozze email Gmail, lista della spesa su un "
+        "foglio Google dedicato - SOLO quella lista, nessun altro contenuto puo' finire li' dentro - verbali audio "
+        "con Google Doc + promemoria, creazione di presentazioni PowerPoint scaricabili con contenuto vero) - se "
+        "stai rispondendo tu in questa chat generica, quei comandi non si sono attivati (puo' succedere anche per "
+        "una richiesta di presentazione se manca l'argomento: in quel caso il comando dedicato avrebbe gia' "
+        "chiesto di cosa deve parlare, quindi fallo anche tu). Se l'utente chiede qualcosa che non sai davvero fare "
+        "(es. un foglio Google generico, un documento Google Docs, qualsiasi altro file scaricabile diverso da una "
+        "presentazione), NON DEVI MAI: inventare un link (docs.google.com, drive.google.com o qualsiasi URL), "
+        "descrivere un'azione come gia' avvenuta ('ho creato...', 'ho salvato...', 'ecco il link...') se non "
+        "l'hai davvero fatta, dare istruzioni che presuppongono l'esistenza di un file che non esiste, NE' "
+        "OFFRIRE O PROMETTERE DI FARLO IN UN MESSAGGIO SUCCESSIVO ('posso anche metterlo in un foglio Google', "
+        "'basta chiedermelo e te lo preparo la' - e' la STESSA bugia dell'azione descritta come gia' fatta, solo "
+        "spostata al turno dopo, e lascia l'utente a chiedere una cosa che poi non arrivera' comunque). Di' "
+        "onestamente che questa funzione non e' ancora disponibile nell'app - punto, senza promettere varianti "
+        "alternative che in realta' non sai fare - e come unica alternativa reale offri di scrivere qui il "
+        "contenuto in modo che l'utente possa copiarlo e incollarlo altrove lui stesso."
     )
     if location_text:
         system_prompt += f"\nPosizione approssimativa dell'utente: {location_text}."
