@@ -29,6 +29,23 @@ import hmac
 import hashlib
 import base64
 
+# Round 20quinquies: "include_granted_scopes=true" (vedi oauth_start piu'
+# sotto) serve apposta a permettere che lo scope concesso da Google cresca
+# nel tempo (es. aggiungere "spreadsheets"/"documents" senza perdere i
+# permessi gia' dati in precedenza) - e' esattamente il meccanismo con cui
+# Massimo ha ricollegato l'account condiviso in questo round. Il problema:
+# la libreria oauthlib usata sotto al cofano da google-auth-oauthlib, per
+# difetto, considera QUALSIASI differenza tra lo scope richiesto e quello
+# davvero concesso da Google come un errore fatale (solleva un'eccezione
+# "Scope has changed from ... to ..." dentro flow.fetch_token(), che
+# interromperebbe con una pagina di errore un ricollegamento altrimenti
+# riuscito) - un comportamento documentato che va in diretto conflitto con
+# "include_granted_scopes=true". Va disattivato esplicitamente PRIMA di
+# qualunque fetch_token(), altrimenti un domani un ricollegamento legittimo
+# (es. scope concesso leggermente diverso da quello richiesto) fallirebbe
+# con un errore 500 invece di completarsi normalmente.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 import requests
 import streamlit as st
 from starlette.responses import Response, RedirectResponse, HTMLResponse, PlainTextResponse, JSONResponse
@@ -274,13 +291,27 @@ async def oauth_callback(request):
             expires_at_iso = creds.expiry.replace(tzinfo=None).isoformat() + "Z"
         conn_type = payload.get("type", "personal")
         user_id = payload.get("user_id") or None
+        # Round 20quinquies: qui andava salvato lo scope DAVVERO concesso da
+        # Google (creds.granted_scopes, che arriva dal campo "scope" della
+        # risposta reale del token endpoint), non "creds.scopes" - quello e'
+        # solo l'elenco RICHIESTO (lo stesso identico GOOGLE_OAUTH_SCOPES
+        # passato a Flow.from_client_config, quindi sempre "vero" a
+        # prescindere da cosa Google abbia realmente concesso). E' lo stesso
+        # bug di fondo gia' corretto in _get_google_credentials nel round
+        # 20quater (li' capitava ad ogni refresh silenzioso, qui capiterebbe
+        # gia' al primo collegamento): scambiare il desiderio dell'app per il
+        # dato reale restituito da Google. Con "include_granted_scopes=true"
+        # (vedi oauth_start) e OAUTHLIB_RELAX_TOKEN_SCOPE=1 qui sopra, uno
+        # scope concesso diverso da quello richiesto e' un caso normale, non
+        # un'eccezione - quindi va gestito correttamente, non ignorato.
+        scope_concesso = getattr(creds, "granted_scopes", None) or creds.scopes
         ok = _save_google_tokens(
             conn_type,
             user_id,
             creds.token,
             creds.refresh_token,
             expires_at_iso,
-            " ".join(creds.scopes) if creds.scopes else "",
+            " ".join(scope_concesso) if scope_concesso else "",
         )
         if not ok:
             return PlainTextResponse("Connessione riuscita con Google ma il salvataggio e' fallito. Riprova.", status_code=500)
