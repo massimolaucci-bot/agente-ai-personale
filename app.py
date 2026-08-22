@@ -2068,6 +2068,48 @@ GOOGLE_TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "cerca_norma",
+            "description": "Cerca davvero una legge/norma vigente sul portale open data ufficiale di Normattiva (leggi, decreti, codici). Usa questo per richieste come 'cerca l'articolo... del codice civile', 'cosa dice la legge su...', 'trovami la norma su...'. Restituisce i riferimenti reali trovati (mai inventati) con un link di ricerca vero su Normattiva.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Termini di ricerca: argomento, numero di articolo, nome della legge/codice, o parole chiave nel testo."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cerca_sentenza_costituzionale",
+            "description": "Prepara un link di ricerca reale sul sito ufficiale della Corte Costituzionale per trovare una sentenza/pronuncia su un certo argomento. Usa questo per richieste come 'cerca una sentenza della Consulta su...', 'cosa ha deciso la Corte Costituzionale riguardo...'. Non legge/riassume il contenuto in automatico: prepara solo il link di ricerca pronto da aprire.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Argomento o parole chiave della sentenza da cercare."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cerca_sentenza_cassazione",
+            "description": "Prepara un link di ricerca reale su SentenzeWeb, il motore di ricerca ufficiale e gratuito della Corte di Cassazione, per trovare una sentenza su un certo argomento. Usa questo per richieste come 'cerca una sentenza di Cassazione su...'. Non legge/riassume il contenuto in automatico (quel sito non offre un'interfaccia programmabile): prepara solo il link di ricerca pronto da aprire.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Argomento o parole chiave della sentenza da cercare."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -2090,13 +2132,15 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
     dismesso llama-3.3-70b-versatile), modello Groq con supporto affidabile
     per i tool personalizzati - non PRIMARY_MODEL ("groq/compound"), il cui
     comportamento con "tools" definiti da noi non e' documentato.
-    NOTA (round 20septies): "crea_presentazione" e' l'unico tool di questo
-    elenco che non serve un account Google - vive comunque qui perche' e' lo
-    stesso classificatore a riconoscerlo. Conseguenza pratica accettata: se
-    Google non e' configurato su questo server, anche la creazione di
-    presentazioni resta disattivata insieme al resto - non e' un problema
-    nella pratica (l'account condiviso di famiglia e' gia' configurato e
-    funzionante), ma va tenuto a mente se Google dovesse mai essere rimosso."""
+    NOTA (round 20septies, valida anche per round 21): "crea_presentazione",
+    "cerca_norma", "cerca_sentenza_costituzionale" e "cerca_sentenza_cassazione"
+    sono gli unici tool di questo elenco che non servono un account Google -
+    vivono comunque qui perche' e' lo stesso classificatore a riconoscerli.
+    Conseguenza pratica accettata: se Google non e' configurato su questo
+    server, anche queste funzioni restano disattivate insieme al resto - non
+    e' un problema nella pratica (l'account condiviso di famiglia e' gia'
+    configurato e funzionante), ma va tenuto a mente se Google dovesse mai
+    essere rimosso."""
     if not _google_oauth_enabled():
         return ("NESSUNA", None)
 
@@ -2349,6 +2393,126 @@ def _gestisci_crea_presentazione(argomenti):
         f"Contiene {len(_slides)} slide di contenuto (oltre a quella di apertura):\n{_elenco_slide}\n\n"
         "E' un file .pptx: si apre con PowerPoint, oppure si puo' importare in Google Slides da Google Drive → "
         "Nuovo → Importa file."
+    )
+
+
+# --- Ricerca giuridica (round 21, richiesta esplicita dell'utente) --------
+# Base reale dell'API open data di Normattiva (dati.normattiva.it, aperta
+# dal gennaio 2026): individuata NON per ipotesi ma osservando davvero, con
+# un browser vero, la richiesta di rete che il portale ufficiale genera
+# quando si esegue una ricerca semplice dalla sua stessa pagina - nessuna
+# chiave/autenticazione richiesta, verificato con una vera chiamata di prova
+# (query "codice civile") che ha restituito davvero il Regio Decreto 262/1942
+# di approvazione del Codice civile. Nessun'altra fonte di questo round
+# (Corte Costituzionale, Cassazione) ha superato lo stesso livello di
+# verifica: il loro endpoint SPARQL open data ha restituito ripetutamente
+# errori 500 nei test reali fatti prima di scrivere questo codice, quindi
+# per onestà (mai costruire su una API che non risulta affidabile davvero)
+# quelle due fonti restano, in questo round, solo un link di ricerca diretto
+# verso il sito ufficiale - mai una lettura/riassunto automatico inventato.
+_NORMATTIVA_API_BASE = "https://api.normattiva.it/t/normattiva.api/bff-opendata/v1/api/v1"
+
+
+def _cerca_normattiva(query):
+    """Cerca davvero leggi/norme vigenti tramite le API open data reali di
+    Normattiva. Ritorna un dict {"atti": [...], "link_ricerca": "..."} con al
+    massimo 5 atti trovati (titolo/descrizione reali, mai inventati) e un
+    link di ricerca vero e verificato sul portale open data, oppure None se
+    la chiamata e' fallita (mai un risultato finto)."""
+    try:
+        _oggi = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d")
+        risposta = requests.post(
+            f"{_NORMATTIVA_API_BASE}/ricerca/semplice",
+            json={
+                "testoRicerca": query,
+                "orderType": "RILEVANZA",
+                "filtriMap": {},
+                "paginazione": {"paginaCorrente": 0, "numeroElementiPerPagina": 5},
+                "limitaAnniVigenza": False,
+            },
+            timeout=10,
+        )
+        risposta.raise_for_status()
+        _dati = risposta.json()
+        _atti = (_dati.get("listaAtti") or [])[:5]
+        _risultati = [
+            {
+                "descrizione": _atto.get("descrizioneAtto") or _atto.get("titoloAtto") or "Atto normativo",
+                "titolo": (_atto.get("titoloAtto") or "").strip().strip("[] \r\n"),
+            }
+            for _atto in _atti
+        ]
+        # Link di ricerca reale sul portale open data (stesso indirizzo
+        # osservato funzionare davvero durante la verifica): mai costruito
+        # un permalink diretto al singolo atto, perche' il formato URN varia
+        # per tipo di atto e non e' stato verificato per tutti i casi - un
+        # link sbagliato sarebbe peggio di nessun link.
+        _link_ricerca = (
+            "https://dati.normattiva.it/risultati?query=" + requests.utils.quote(query)
+            + f"&isSimpleSearch=true&isAdvancedSearch=false&isVigenzaSelected=false"
+            + f"&isReset=true&isFilterSelected=false&vigenzaDate={_oggi}"
+        )
+        return {"atti": _risultati, "link_ricerca": _link_ricerca}
+    except Exception as e:
+        print(f"[ricerca giuridica] _cerca_normattiva fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _gestisci_cerca_norma(argomenti):
+    """Orchestratore per 'cerca_norma': interroga Normattiva davvero e
+    ritorna solo dati reali (titoli/atti trovati dalla vera API, link di
+    ricerca vero) - mai un riferimento normativo inventato."""
+    _query = (argomenti.get("query") or "").strip()
+    if not _query:
+        return "Dimmi cosa devo cercare (un argomento, un articolo, il nome di una legge o di un codice)."
+
+    _esito = _cerca_normattiva(_query)
+    if _esito is None:
+        return (
+            f"Non sono riuscito a interrogare Normattiva in questo momento: riprova tra poco, oppure cerca "
+            f"direttamente qui: https://dati.normattiva.it/risultati?query={requests.utils.quote(_query)}"
+        )
+
+    if not _esito["atti"]:
+        return f"Non ho trovato atti su Normattiva per \"{_query}\". Puoi provare a cercare direttamente qui: {_esito['link_ricerca']}"
+
+    _elenco = "\n".join(f"- {a['descrizione']}" for a in _esito["atti"])
+    return (
+        f"Ecco quello che ho trovato su Normattiva per \"{_query}\":\n\n{_elenco}\n\n"
+        f"Puoi vedere l'elenco completo e aprire il testo vigente qui: {_esito['link_ricerca']}"
+    )
+
+
+def _gestisci_cerca_sentenza_costituzionale(argomenti):
+    """Orchestratore per 'cerca_sentenza_costituzionale': NON legge/riassume
+    nulla in automatico (vedi nota sopra sul perche' l'endpoint open data
+    della Corte Costituzionale non e' stato usato in questo round) - prepara
+    solo un link di ricerca reale e verificato sul sito ufficiale."""
+    _query = (argomenti.get("query") or "").strip()
+    if not _query:
+        return "Dimmi l'argomento della sentenza della Corte Costituzionale che vuoi cercare."
+    _link = "https://www.cortecostituzionale.it/ricerca-pronunce"
+    return (
+        f"Non posso ancora leggere/riassumere automaticamente le sentenze della Corte Costituzionale, ma ecco il "
+        f"link ufficiale per cercarle tu stesso: {_link}\n\nCerca lì: \"{_query}\"."
+    )
+
+
+def _gestisci_cerca_sentenza_cassazione(argomenti):
+    """Orchestratore per 'cerca_sentenza_cassazione': su scelta esplicita di
+    Massimo, mai una lettura/riassunto automatico (SentenzeWeb non offre
+    un'interfaccia programmabile, il suo robots.txt vieta l'accesso
+    automatizzato, e il D.P.R. 195/2004 vieta il riuso dei dati fuori dal
+    servizio pubblico di informatica giuridica) - solo un link diretto reale
+    verso il motore di ricerca ufficiale e gratuito della Cassazione."""
+    _query = (argomenti.get("query") or "").strip()
+    if not _query:
+        return "Dimmi l'argomento della sentenza di Cassazione che vuoi cercare."
+    _link = "https://www.italgiure.giustizia.it/sncass/"
+    return (
+        f"Non posso leggere/cercare automaticamente tra le sentenze di Cassazione (quel sito non offre un accesso "
+        f"automatizzato), ma ecco il link ufficiale e gratuito per cercarle tu stesso: {_link}\n\n"
+        f"Cerca lì: \"{_query}\"."
     )
 
 
@@ -2624,13 +2788,20 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
     # sarebbe stato piu' fragile che tenerle separate cosi'.
     argomenti = argomenti or {}
 
-    # "crea_presentazione" (round 20septies) e' l'unica azione di questo
-    # elenco che NON tocca Google: crea un file .pptx vero e lo carica su R2,
-    # non serve nessun account collegato. Va gestita PRIMA del controllo
-    # OAuth/credenziali qui sotto, altrimenti fallirebbe a chiedere un
-    # collegamento Google che non le serve affatto.
+    # "crea_presentazione" (round 20septies) e "cerca_norma" /
+    # "cerca_sentenza_costituzionale" / "cerca_sentenza_cassazione" (round
+    # 21) sono le uniche azioni di questo elenco che NON toccano Google:
+    # vanno gestite PRIMA del controllo OAuth/credenziali qui sotto,
+    # altrimenti fallirebbero a chiedere un collegamento Google che non gli
+    # serve affatto.
     if azione_nome == "crea_presentazione":
         return _gestisci_crea_presentazione(argomenti)
+    if azione_nome == "cerca_norma":
+        return _gestisci_cerca_norma(argomenti)
+    if azione_nome == "cerca_sentenza_costituzionale":
+        return _gestisci_cerca_sentenza_costituzionale(argomenti)
+    if azione_nome == "cerca_sentenza_cassazione":
+        return _gestisci_cerca_sentenza_cassazione(argomenti)
 
     if not _google_oauth_enabled():
         return "La connessione con Google non e' ancora configurata su questo server."
@@ -2837,10 +3008,11 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "funzionanti. Le uniche azioni reali che l'app sa fare sono attivate da comandi specifici riconosciuti "
         "automaticamente PRIMA di arrivare qui (calendario, lettura/bozze email Gmail, lista della spesa su un "
         "foglio Google dedicato - SOLO quella lista, nessun altro contenuto puo' finire li' dentro - verbali audio "
-        "con Google Doc + promemoria, creazione di presentazioni PowerPoint scaricabili con contenuto vero) - se "
-        "stai rispondendo tu in questa chat generica, quei comandi non si sono attivati (puo' succedere anche per "
-        "una richiesta di presentazione se manca l'argomento: in quel caso il comando dedicato avrebbe gia' "
-        "chiesto di cosa deve parlare, quindi fallo anche tu). Se l'utente chiede qualcosa che non sai davvero fare "
+        "con Google Doc + promemoria, creazione di presentazioni PowerPoint scaricabili con contenuto vero, ricerca "
+        "vera di norme/leggi su Normattiva, link di ricerca reali per sentenze della Corte Costituzionale e della "
+        "Cassazione) - se stai rispondendo tu in questa chat generica, quei comandi non si sono attivati (puo' "
+        "succedere anche se manca l'argomento/la query: in quel caso il comando dedicato avrebbe gia' chiesto il "
+        "dettaglio mancante, quindi fallo anche tu). Se l'utente chiede qualcosa che non sai davvero fare "
         "(es. un foglio Google generico, un documento Google Docs, qualsiasi altro file scaricabile diverso da una "
         "presentazione), NON DEVI MAI: inventare un link (docs.google.com, drive.google.com o qualsiasi URL), "
         "descrivere un'azione come gia' avvenuta ('ho creato...', 'ho salvato...', 'ecco il link...') se non "
