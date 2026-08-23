@@ -2119,7 +2119,7 @@ GOOGLE_TOOLS_SCHEMA = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Nome del piatto o argomento libero, se l'utente ha chiesto un piatto specifico (es. 'tiramisu')."},
-                    "ingrediente": {"type": "string", "description": "Ingrediente principale richiesto, se la richiesta e' basata su un ingrediente (es. 'zucchine', 'pollo')."},
+                    "ingrediente": {"type": "string", "description": "Ingrediente principale richiesto, TRADOTTO IN INGLESE come lo vuole l'API della fonte (es. l'utente dice 'zucchine' -> 'courgette' o 'zucchini', l'utente dice 'pollo' -> 'chicken'), se la richiesta e' basata su un ingrediente."},
                     "area": {"type": "string", "description": "Cucina/nazionalita' richiesta in inglese (es. 'Italian', 'Chinese', 'French', 'American', 'Brazilian'), se l'utente ha chiesto una cucina specifica."},
                     "categoria": {"type": "string", "description": "Categoria richiesta in inglese (es. 'Dessert', 'Starter', 'Seafood', 'Vegetarian'), se l'utente ha chiesto un tipo di portata specifico."},
                 },
@@ -2642,11 +2642,28 @@ def _mealdb_dettaglio_da_lista(lista):
 
 
 def _cerca_ricetta_mealdb(query, ingrediente=None, area=None, categoria=None):
-    """Interroga davvero l'API pubblica di TheMealDB. Priorita': un
-    ingrediente/area/categoria specifici (piu' mirati) prima della ricerca
-    libera per nome. Ritorna il dizionario "meal" reale della fonte, oppure
-    None se non trova nulla o l'API non risponde - mai un piatto inventato."""
+    """Interroga davvero l'API pubblica di TheMealDB. Priorita': un piatto
+    specifico richiesto per nome (query) e' il segnale piu' preciso possibile
+    (ricerca esatta su search.php) e va sempre usato per primo se presente -
+    altrimenti un modello di function-calling reale puo' riempire ANCHE
+    ingrediente/area/categoria come "arricchimento" pur avendo gia' un nome
+    piatto preciso, facendo ignorare quel nome e restituendo un piatto a
+    caso della categoria/area indovinata (bug reale osservato in produzione
+    nel round 22: "cerca la ricetta della lasagna" restituiva un budino,
+    perche' la categoria indovinata dal modello aveva priorita' sul nome).
+    Solo se manca un nome piatto specifico si usano i filtri piu' generici
+    (ingrediente, poi area, poi categoria), in ordine dal piu' al meno
+    mirato. Ritorna il dizionario "meal" reale della fonte, oppure None se
+    non trova nulla o l'API non risponde - mai un piatto inventato."""
     try:
+        if query:
+            _r = requests.get(f"{_MEALDB_API_BASE}/search.php", params={"s": query}, timeout=10)
+            _r.raise_for_status()
+            _pasti = (_r.json() or {}).get("meals") or []
+            if _pasti:
+                return _pasti[0]
+            # Nessun risultato esatto per nome: prova comunque i filtri piu'
+            # generici forniti insieme, invece di arrenderti subito.
         if ingrediente:
             _r = requests.get(f"{_MEALDB_API_BASE}/filter.php", params={"i": ingrediente}, timeout=10)
             _r.raise_for_status()
@@ -2659,11 +2676,6 @@ def _cerca_ricetta_mealdb(query, ingrediente=None, area=None, categoria=None):
             _r = requests.get(f"{_MEALDB_API_BASE}/filter.php", params={"c": categoria}, timeout=10)
             _r.raise_for_status()
             return _mealdb_dettaglio_da_lista((_r.json() or {}).get("meals") or [])
-        if query:
-            _r = requests.get(f"{_MEALDB_API_BASE}/search.php", params={"s": query}, timeout=10)
-            _r.raise_for_status()
-            _pasti = (_r.json() or {}).get("meals") or []
-            return _pasti[0] if _pasti else None
         return None
     except Exception as e:
         print(f"[ricette] _cerca_ricetta_mealdb fallita: {type(e).__name__}: {e}", flush=True)
