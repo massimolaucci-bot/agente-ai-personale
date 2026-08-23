@@ -1513,6 +1513,288 @@ def _gestisci_lista_spesa(creds, azione, articoli, nome_utente):
         return "Non sono riuscito ad accedere alla lista della spesa in questo momento."
 
 
+# --- Creazione libera di Fogli e Documenti Google (round 23) ----------------
+# Richiesta esplicita di Massimo dopo il round 22: "dei fogli di google
+# l'applicazione deve disporre in tutte le possibili richieste, voglio che
+# non ci sia un limite, io dico lei esegue" - quindi non piu' un singolo
+# foglio fisso con uno schema predefinito (come la lista della spesa qui
+# sopra), ma un foglio o documento NUOVO ogni volta, con il contenuto che
+# l'utente chiede. Usa lo stesso scope "drive.file" gia' concesso (nessun
+# nuovo permesso Google richiesto per Fogli/Documenti - solo per le
+# presentazioni Google Slides native, non ancora costruite, servirebbe un
+# permesso nuovo).
+# Vincolo esplicito di Massimo: ogni file va SEMPRE anche reso scaricabile
+# direttamente in chat (non solo salvato su Drive), e la condivisione con un
+# indirizzo Google va fatta solo quando lui la chiede esplicitamente, mai
+# in automatico con un indirizzo indovinato.
+_MIME_EXPORT_FOGLIO = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_MIME_EXPORT_DOCUMENTO = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _registra_file_google_creato(conn_type, conn_user_id, family_user_id, drive_file_id, tipo, titolo, link_download):
+    if not _supabase_enabled():
+        return
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/google_file_creati",
+            headers=SUPABASE_HEADERS,
+            json={
+                "family_user_id": family_user_id,
+                "conn_type": conn_type,
+                "conn_user_id": conn_user_id,
+                "drive_file_id": drive_file_id,
+                "tipo": tipo,
+                "titolo": titolo,
+                "link_download": link_download,
+            },
+            timeout=SUPABASE_TIMEOUT,
+        ).raise_for_status()
+    except Exception as e:
+        print(f"[google_file] registrazione file creato fallita: {type(e).__name__}: {e}", flush=True)
+
+
+def _trova_file_google_recente(titolo_riferimento=None):
+    """Cerca l'ultimo file (Foglio o Documento) creato da questa app, per
+    capire a cosa si riferisce l'utente quando dice "condividilo con..."
+    senza ripetere il titolo. Se viene dato un titolo (anche parziale), cerca
+    prima quello; altrimenti prende semplicemente l'ultimo creato in assoluto
+    (l'app serve una sola famiglia, non serve altro filtro)."""
+    if not _supabase_enabled():
+        return None
+    try:
+        _params = {"select": "*", "order": "creato_il.desc", "limit": "1"}
+        if titolo_riferimento:
+            _params["titolo"] = f"ilike.*{titolo_riferimento}*"
+        _r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/google_file_creati",
+            headers=SUPABASE_HEADERS,
+            params=_params,
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        _righe = _r.json()
+        if _righe:
+            return _righe[0]
+        if titolo_riferimento:
+            # Nessun file con quel titolo: ripiega sull'ultimo creato in
+            # assoluto piuttosto che arrendersi subito.
+            return _trova_file_google_recente(None)
+        return None
+    except Exception as e:
+        print(f"[google_file] ricerca file recente fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _genera_contenuto_foglio(titolo, descrizione):
+    """Quando l'utente non da' righe/colonne precise ma solo una descrizione
+    libera (es. "un sondaggio per i gusti di gelato preferiti"), chiede a
+    Groq di preparare intestazioni e righe di partenza plausibili. Ritorna
+    (colonne, righe) o (None, None) se la generazione fallisce - mai una
+    tabella vuota o inventata a mano nel codice."""
+    try:
+        _prompt = (
+            "Prepara la struttura di un foglio di calcolo Google in italiano, a partire da questa richiesta.\n\n"
+            f"Titolo del foglio: {titolo}\n"
+            f"Richiesta dell'utente: {descrizione}\n\n"
+            "Rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo, in questo formato esatto:\n"
+            '{"colonne": ["Intestazione1", "Intestazione2", ...], "righe": [["valore1", "valore2", ...], ...]}\n'
+            "Se la richiesta e' un sondaggio o un modulo da compilare, prepara le colonne adatte a raccogliere le "
+            "risposte (es. Nome, Risposta, Data) e lascia le righe vuote o con un solo esempio guida, non inventare "
+            "risposte finte spacciate per reali."
+        )
+        _client_foglio = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        _completamento = _client_foglio.chat.completions.create(
+            model=FALLBACK_MODEL, messages=[{"role": "user", "content": _prompt}], max_tokens=1200,
+        )
+        _testo = _completamento.choices[0].message.content or ""
+        _inizio = _testo.index("{")
+        _fine = _testo.rindex("}") + 1
+        _dati = json.loads(_testo[_inizio:_fine])
+        _colonne = [str(c).strip() for c in (_dati.get("colonne") or []) if str(c).strip()]
+        _righe = [[str(v) for v in r] for r in (_dati.get("righe") or []) if isinstance(r, list)]
+        if not _colonne:
+            return None, None
+        return _colonne[:15], _righe[:200]
+    except Exception as e:
+        print(f"[foglio_google] generazione contenuto fallita: {type(e).__name__}: {e}", flush=True)
+        return None, None
+
+
+def _genera_contenuto_documento(titolo, descrizione):
+    """Quando l'utente chiede un testo libero (es. una lettera) invece di
+    dettare il contenuto esatto, chiede a Groq di scriverne una bozza.
+    Ritorna il testo o None se fallisce. Il chiamante deve sempre avvisare
+    che e' una bozza generata dall'IA da rileggere, mai spacciarla per un
+    testo scritto/approvato dall'utente."""
+    try:
+        _prompt = (
+            "Scrivi in italiano il testo completo di un documento, secondo questa richiesta. Scrivi solo il testo "
+            "del documento (nessuna nota, nessuna intestazione tipo 'Ecco la bozza'), pronto per essere salvato "
+            "cosi' com'e'.\n\n"
+            f"Titolo/argomento: {titolo}\n"
+            f"Richiesta dell'utente: {descrizione}"
+        )
+        _client_doc = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        _completamento = _client_doc.chat.completions.create(
+            model=FALLBACK_MODEL, messages=[{"role": "user", "content": _prompt}], max_tokens=1800,
+        )
+        _testo = (_completamento.choices[0].message.content or "").strip()
+        return _testo or None
+    except Exception as e:
+        print(f"[documento_google] generazione contenuto fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _esporta_e_carica_r2(creds, drive_file_id, mime_export, estensione, nome_file_sicuro):
+    """Scarica il file Google (Foglio o Documento) gia' creato, esportato nel
+    formato indicato (xlsx/docx), e lo carica su R2 per ottenere un link di
+    download reale - stesso bucket/meccanismo gia' in uso per le
+    presentazioni PowerPoint. Ritorna il link o None se qualcosa fallisce."""
+    if not _r2_enabled():
+        return None
+    try:
+        drive_service = google_build("drive", "v3", credentials=creds)
+        _contenuto = drive_service.files().export(fileId=drive_file_id, mimeType=mime_export).execute()
+        return r2_upload(_contenuto, f"{nome_file_sicuro}.{estensione}", R2_BUCKET_ALLEGATI, R2_PUBLIC_URL_ALLEGATI)
+    except Exception as e:
+        print(f"[google_file] esportazione/upload R2 fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _gestisci_crea_foglio_google(argomenti, creds, utente, conn_type, conn_user_id):
+    _titolo = (argomenti.get("titolo") or "").strip() or "Foglio Carpanet AI"
+    _colonne = argomenti.get("colonne") or []
+    _righe = argomenti.get("righe") or []
+    _descrizione = (argomenti.get("descrizione") or "").strip()
+    _bozza_ia = False
+
+    if not _colonne and _descrizione:
+        _colonne, _righe = _genera_contenuto_foglio(_titolo, _descrizione)
+        _bozza_ia = True
+    if not _colonne:
+        return "Dimmi le intestazioni delle colonne del foglio (es. \"Data, Ingrediente, Peso\") oppure descrivimi cosa deve contenere, cosi' preparo io una proposta."
+
+    try:
+        sheets_service = google_build("sheets", "v4", credentials=creds)
+        _nuovo = sheets_service.spreadsheets().create(body={
+            "properties": {"title": _titolo},
+            "sheets": [{"properties": {"title": "Foglio1"}}],
+        }).execute()
+        _spreadsheet_id = _nuovo["spreadsheetId"]
+        _valori = [_colonne] + [r + [""] * (len(_colonne) - len(r)) for r in _righe]
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=_spreadsheet_id, range="Foglio1!A1",
+            valueInputOption="USER_ENTERED", body={"values": _valori},
+        ).execute()
+    except GoogleHttpError as e:
+        if getattr(e, "status_code", None) == 403 or " 403" in str(e) or "insufficient" in str(e).lower():
+            return (
+                "Per creare fogli Google serve un permesso che il tuo collegamento attuale non ha ancora: vai in "
+                "barra laterale, sezione \"Collegamenti Google\", disconnetti e ricollega il tuo account per concederlo."
+            )
+        print(f"[foglio_google] creazione fallita: {e}", flush=True)
+        return "Non sono riuscito a creare il foglio Google in questo momento: riprova tra poco."
+    except Exception as e:
+        print(f"[foglio_google] creazione fallita: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a creare il foglio Google in questo momento: riprova tra poco."
+
+    _nome_file_sicuro = re.sub(r"[^A-Za-z0-9 _-]", "", _titolo).strip().replace(" ", "_") or "foglio"
+    _link = _esporta_e_carica_r2(creds, _spreadsheet_id, _MIME_EXPORT_FOGLIO, "xlsx", _nome_file_sicuro)
+    _registra_file_google_creato(conn_type, conn_user_id, utente.get("id"), _spreadsheet_id, "foglio", _titolo, _link)
+
+    _msg = f"✅ Ho creato davvero il foglio Google \"{_titolo}\""
+    _msg += " (bozza generata da me: ricontrolla i dati prima di usarlo)" if _bozza_ia else ""
+    _msg += ".\n"
+    if _link:
+        _msg += f"📥 Scaricalo qui: {_link}\n"
+    else:
+        _msg += "(non sono riuscito a preparare anche il link di download diretto, ma il foglio esiste su Google)\n"
+    _msg += "Vuoi che lo condivida anche su Google Drive con qualcuno? Dimmi l'indirizzo email."
+    return _msg
+
+
+def _gestisci_crea_documento_google(argomenti, creds, utente, conn_type, conn_user_id):
+    _titolo = (argomenti.get("titolo") or "").strip() or "Documento Carpanet AI"
+    _contenuto = (argomenti.get("contenuto") or "").strip()
+    _descrizione = (argomenti.get("descrizione") or "").strip()
+    _bozza_ia = False
+
+    if not _contenuto and _descrizione:
+        _contenuto = _genera_contenuto_documento(_titolo, _descrizione)
+        _bozza_ia = True
+    if not _contenuto:
+        return "Dimmi il testo esatto da mettere nel documento, oppure descrivimi cosa deve dire (es. \"una lettera per...\"), cosi' preparo io una bozza."
+
+    try:
+        drive_service = google_build("drive", "v3", credentials=creds)
+        _doc = drive_service.files().create(
+            body={"name": _titolo, "mimeType": "application/vnd.google-apps.document"}, fields="id",
+        ).execute()
+        _doc_id = _doc["id"]
+        docs_service = google_build("docs", "v1", credentials=creds)
+        docs_service.documents().batchUpdate(
+            documentId=_doc_id,
+            body={"requests": [{"insertText": {"location": {"index": 1}, "text": _contenuto}}]},
+        ).execute()
+    except GoogleHttpError as e:
+        if getattr(e, "status_code", None) == 403 or " 403" in str(e) or "insufficient" in str(e).lower():
+            return (
+                "Per creare documenti Google serve un permesso che il tuo collegamento attuale non ha ancora: vai "
+                "in barra laterale, sezione \"Collegamenti Google\", disconnetti e ricollega il tuo account per "
+                "concederlo."
+            )
+        print(f"[documento_google] creazione fallita: {e}", flush=True)
+        return "Non sono riuscito a creare il documento Google in questo momento: riprova tra poco."
+    except Exception as e:
+        print(f"[documento_google] creazione fallita: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a creare il documento Google in questo momento: riprova tra poco."
+
+    _nome_file_sicuro = re.sub(r"[^A-Za-z0-9 _-]", "", _titolo).strip().replace(" ", "_") or "documento"
+    _link = _esporta_e_carica_r2(creds, _doc_id, _MIME_EXPORT_DOCUMENTO, "docx", _nome_file_sicuro)
+    _registra_file_google_creato(conn_type, conn_user_id, utente.get("id"), _doc_id, "documento", _titolo, _link)
+
+    _msg = f"✅ Ho creato davvero il documento Google \"{_titolo}\""
+    _msg += " (bozza generata da me: rileggila prima di usarla)" if _bozza_ia else ""
+    _msg += ".\n"
+    if _link:
+        _msg += f"📥 Scaricalo qui: {_link}\n"
+    else:
+        _msg += "(non sono riuscito a preparare anche il link di download diretto, ma il documento esiste su Google)\n"
+    _msg += "Vuoi che lo condivida anche su Google Drive con qualcuno? Dimmi l'indirizzo email."
+    return _msg
+
+
+def _gestisci_condividi_file_google(argomenti, utente):
+    _email = (argomenti.get("email") or "").strip()
+    _riferimento = (argomenti.get("riferimento") or "").strip() or None
+    if not _email or "@" not in _email:
+        return "A quale indirizzo email devo condividere il file? Scrivimelo per esteso."
+
+    _riga = _trova_file_google_recente(_riferimento)
+    if not _riga:
+        return "Non trovo nessun foglio o documento creato di recente a cui riferirmi: creane prima uno."
+
+    _creds = _get_google_credentials(_riga.get("conn_type"), _riga.get("conn_user_id"))
+    if not _creds:
+        return "Non riesco ad accedere all'account Google con cui era stato creato quel file in questo momento."
+
+    try:
+        drive_service = google_build("drive", "v3", credentials=_creds)
+        drive_service.permissions().create(
+            fileId=_riga["drive_file_id"],
+            body={"type": "user", "role": "writer", "emailAddress": _email},
+            sendNotificationEmail=True,
+        ).execute()
+    except GoogleHttpError as e:
+        print(f"[google_file] condivisione fallita: {e}", flush=True)
+        return f"Non sono riuscito a condividerlo con {_email}: controlla che l'indirizzo sia corretto e riprova."
+    except Exception as e:
+        print(f"[google_file] condivisione fallita: {type(e).__name__}: {e}", flush=True)
+        return f"Non sono riuscito a condividerlo con {_email}: riprova tra poco."
+
+    return f"✅ \"{_riga['titolo']}\" condiviso davvero con {_email} (arrivera' anche una notifica via email da Google)."
+
+
 # --- Verbali audio: un messaggio vocale che inizia con "verbale" (stessa
 # convenzione gia' in uso per "addestramento") viene trascritto, riassunto
 # dall'IA in un verbale ordinato, salvato come Google Doc, mentre l'audio
@@ -2186,6 +2468,54 @@ GOOGLE_TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "crea_foglio_google",
+            "description": "Crea davvero un nuovo Foglio Google (Google Sheets) con qualunque contenuto richiesto - senza limiti sul tipo di richiesta: un foglio di calcolo con date/circostanze/ingredienti/pesi, un sondaggio, un elenco, una tabella qualsiasi. Richiede un account Google collegato. Usa questo per richieste come 'fammi un foglio di calcolo con...', 'crea un foglio Google per...', 'prepara un sondaggio su...'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titolo": {"type": "string", "description": "Titolo breve del foglio."},
+                    "colonne": {"type": "array", "items": {"type": "string"}, "description": "Intestazioni delle colonne, SOLO se l'utente le ha indicate esplicitamente (es. 'Data, Ingrediente, Peso') - non inventarle."},
+                    "righe": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Righe di dati esatti forniti dall'utente (una lista per riga, stesso ordine delle colonne), SOLO se li ha davvero dettati - non inventarli."},
+                    "descrizione": {"type": "string", "description": "Se l'utente NON ha dato colonne/righe precise ma solo una richiesta libera (es. 'un sondaggio sui gusti di gelato preferiti'), riporta qui la richiesta cosi' com'e': verra' generata una bozza di struttura da fargli rivedere."},
+                },
+                "required": ["titolo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "crea_documento_google",
+            "description": "Crea davvero un nuovo Documento Google (Google Docs) scaricabile e condivisibile, con qualunque testo richiesto: una lettera, un testo libero, un modulo scritto. Richiede un account Google collegato. Usa questo per richieste come 'scrivimi una lettera per...', 'crea un documento Google su...', 'preparami un testo scritto su...'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titolo": {"type": "string", "description": "Titolo breve del documento."},
+                    "contenuto": {"type": "string", "description": "Testo esatto da inserire, SOLO se l'utente lo ha dettato per intero lui stesso - non riscriverlo/riassumerlo."},
+                    "descrizione": {"type": "string", "description": "Se l'utente NON ha dettato il testo esatto ma ha chiesto una bozza (es. 'scrivimi una lettera di dimissioni per...'), riporta qui la richiesta cosi' com'e': verra' generata una bozza da fargli rileggere prima dell'uso."},
+                },
+                "required": ["titolo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "condividi_file_google",
+            "description": "Condivide su Google Drive, con un indirizzo email indicato dall'utente, l'ultimo Foglio o Documento Google creato con crea_foglio_google/crea_documento_google (o un altro, se l'utente indica il titolo). Usa questo SOLO quando l'utente chiede esplicitamente di condividere/mandare un file gia' creato a un indirizzo preciso, mai in automatico.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email": {"type": "string", "description": "Indirizzo email esatto con cui condividere, cosi' come scritto per esteso dall'utente in questo messaggio - non inventarlo mai."},
+                    "riferimento": {"type": "string", "description": "Titolo (anche parziale) del file a cui si riferisce, SOLO se lo specifica; altrimenti lascia vuoto e verra' usato l'ultimo file creato."},
+                },
+                "required": ["email"],
+            },
+        },
+    },
 ]
 
 
@@ -2214,6 +2544,11 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
     "ricetta_feedback" e "ricetta_rimuovi_preferita" sono gli unici tool di questo
     elenco che non servono un account Google - vivono comunque qui perche' e' lo
     stesso classificatore a riconoscerli.
+    NOTA (round 23): "crea_foglio_google", "crea_documento_google" e
+    "condividi_file_google" SERVONO invece un account Google (stesso scope
+    gia' concesso per la lista della spesa: "spreadsheets"/"documents"/
+    "drive.file"), quindi passano dal normale controllo OAuth qui sotto come
+    tutte le altre azioni Google.
     Conseguenza pratica accettata: se Google non e' configurato su questo
     server, anche queste funzioni restano disattivate insieme al resto - non
     e' un problema nella pratica (l'account condiviso di famiglia e' gia'
@@ -2236,9 +2571,13 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
         "destinatario, 'cancella l'audio' senza dire quale), NON chiamare nessun tool: rispondi invece con una "
         "domanda di chiarimento breve e diretta in italiano, cosi' l'utente puo' risponderti con il dettaglio mancante.\n"
         "3. Se il messaggio non riguarda nessuna di queste azioni (conversazione generica, domande su altri "
-        "argomenti, richieste di creare file che l'app non sa ancora fare, es. un foglio Google generico o un "
-        "documento Word/Docs), NON chiamare nessun tool e rispondi ESATTAMENTE con il testo NESSUNA_AZIONE, senza "
-        "nient'altro.\n"
+        "argomenti), NON chiamare nessun tool e rispondi ESATTAMENTE con il testo NESSUNA_AZIONE, senza nient'altro. "
+        "ATTENZIONE: una richiesta di creare un foglio di calcolo Google, un documento Google scritto (es. una "
+        "lettera), o di condividere un file gia' creato, VA riconosciuta con crea_foglio_google/"
+        "crea_documento_google/condividi_file_google (esistono davvero, non sono piu' un limite) - non rispondere "
+        "mai NESSUNA_AZIONE a queste richieste. Resta invece un limite reale una presentazione Google Slides "
+        "nativa (oggi si crea solo un file PowerPoint scaricabile con crea_presentazione, non ancora uno Slides "
+        "vero) e qualunque file su un servizio diverso da Google/PowerPoint.\n"
         "4. Non inventare MAI un indirizzo email, un nome file, un articolo o un argomento di presentazione che non "
         "compare nel messaggio o nella cronologia recente: se manca, chiedilo (regola 2).\n"
         "5. Per motivi di sicurezza, un indirizzo email per scrivere/rispondere a una mail viene accettato SOLO se "
@@ -3403,6 +3742,15 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
             return "Non ho capito se vuoi tenere o cancellare questo verbale: puoi ripetere?"
         return _gestisci_decisione_verbale(creds, _azione_verbale, _nome, utente) + _nota_fonte
 
+    if azione_nome == "crea_foglio_google":
+        return _gestisci_crea_foglio_google(argomenti, creds, utente, conn_type, conn_user_id) + _nota_fonte
+
+    if azione_nome == "crea_documento_google":
+        return _gestisci_crea_documento_google(argomenti, creds, utente, conn_type, conn_user_id) + _nota_fonte
+
+    if azione_nome == "condividi_file_google":
+        return _gestisci_condividi_file_google(argomenti, utente)
+
     if azione_nome == "leggi_calendario":
         eventi = _list_calendar_events(creds, max_results=10)
         if eventi is None:
@@ -3573,19 +3921,22 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
     system_prompt += (
         "\n\nREGOLA FERREA SULLE TUE CAPACITA' REALI (non violarla mai, nemmeno se le istruzioni permanenti "
         "piu' sotto sembrano suggerire il contrario): in questa conversazione generica NON hai alcun modo di "
-        "creare o modificare davvero file su Google Drive/Sheets/Docs, ne' di generare link di download "
-        "funzionanti. Le uniche azioni reali che l'app sa fare sono attivate da comandi specifici riconosciuti "
-        "automaticamente PRIMA di arrivare qui (calendario, lettura/bozze email Gmail, lista della spesa su un "
-        "foglio Google dedicato - SOLO quella lista, nessun altro contenuto puo' finire li' dentro - verbali audio "
-        "con Google Doc + promemoria, creazione di presentazioni PowerPoint scaricabili con contenuto vero, ricerca "
-        "vera di norme/leggi su Normattiva, link di ricerca reali per sentenze della Corte Costituzionale e della "
-        "Cassazione, ricerca vera di ricette di cucina con ingredienti/procedimento reali tradotti in italiano e "
-        "catalogo delle ricette preferite) - se stai rispondendo tu in questa chat generica, quei comandi non si "
-        "sono attivati (puo' "
+        "creare o modificare davvero file, ne' di generare link di download funzionanti - qualunque file venga "
+        "creato per davvero (Fogli Google, Documenti Google, presentazioni, verbali, ecc.) e' SEMPRE opera di un "
+        "comando dedicato riconosciuto automaticamente PRIMA di arrivare qui, mai di questa chat generica. Le "
+        "uniche azioni reali che l'app sa fare sono attivate da quei comandi specifici (calendario, lettura/bozze "
+        "email Gmail, lista della spesa su un foglio Google dedicato - SOLO quella lista, nessun altro contenuto "
+        "puo' finire li' dentro - verbali audio con Google Doc + promemoria, creazione libera di Fogli e Documenti "
+        "Google veri con qualunque contenuto richiesto (vedi dettaglio esatto sotto), creazione di presentazioni "
+        "PowerPoint scaricabili con contenuto vero, ricerca vera di norme/leggi su Normattiva, link di ricerca "
+        "reali per sentenze della Corte Costituzionale e della Cassazione, ricerca vera di ricette di cucina con "
+        "ingredienti/procedimento reali tradotti in italiano e catalogo delle ricette preferite) - se stai "
+        "rispondendo tu in questa chat generica, quei comandi non si sono attivati (puo' "
         "succedere anche se manca l'argomento/la query: in quel caso il comando dedicato avrebbe gia' chiesto il "
         "dettaglio mancante, quindi fallo anche tu). Se l'utente chiede qualcosa che non sai davvero fare "
-        "(es. un foglio Google generico, un documento Google Docs, qualsiasi altro file scaricabile diverso da una "
-        "presentazione), NON DEVI MAI: inventare un link (docs.google.com, drive.google.com o qualsiasi URL), "
+        "(oggi, l'unico limite reale rimasto su Google e' una presentazione Google Slides NATIVA - quella esiste "
+        "solo come file PowerPoint scaricabile - e qualunque file su un servizio diverso da Google/PowerPoint), "
+        "NON DEVI MAI: inventare un link (docs.google.com, drive.google.com o qualsiasi URL), "
         "descrivere un'azione come gia' avvenuta ('ho creato...', 'ho salvato...', 'ecco il link...') se non "
         "l'hai davvero fatta, dare istruzioni che presuppongono l'esistenza di un file che non esiste, NE' "
         "OFFRIRE O PROMETTERE DI FARLO IN UN MESSAGGIO SUCCESSIVO ('posso anche metterlo in un foglio Google', "
@@ -3594,6 +3945,17 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "onestamente che questa funzione non e' ancora disponibile nell'app - punto, senza promettere varianti "
         "alternative che in realta' non sai fare - e come unica alternativa reale offri di scrivere qui il "
         "contenuto in modo che l'utente possa copiarlo e incollarlo altrove lui stesso."
+        "\n\nDETTAGLIO ESATTO SU FOGLI E DOCUMENTI GOOGLE LIBERI (round 23, obbligatorio se ti viene chiesto cosa "
+        "sai fare con Fogli/Documenti Google - descrivi SOLO questo, MAI un limite ormai superato): l'app crea "
+        "DAVVERO un nuovo Foglio Google o Documento Google, con qualunque contenuto l'utente chieda (un foglio di "
+        "calcolo con date/ingredienti/pesi, un sondaggio, una lettera, un testo libero) - non c'e' un limite sul "
+        "tipo di richiesta. Se l'utente non detta dati/testo esatti ma solo una descrizione libera, l'app genera "
+        "una bozza plausibile e lo dice chiaramente, invitando a ricontrollarla. Ogni volta, insieme al file creato "
+        "su Google, arriva SEMPRE anche un link di download diretto in chat (non serve andare su Drive per "
+        "scaricarlo). La condivisione del file su Google Drive con un indirizzo email NON e' mai automatica: "
+        "avviene solo se l'utente la chiede esplicitamente dicendo l'indirizzo per esteso, e riguarda l'ultimo "
+        "file creato (o quello indicato per titolo). Resta vero, e va detto se chiesto, che una presentazione "
+        "Google Slides nativa non esiste ancora - solo un file PowerPoint scaricabile."
         "\n\nDETTAGLIO ESATTO SUL CATALOGO DELLE RICETTE PREFERITE (obbligatorio se ti viene chiesto cosa sai fare "
         "con le ricette, o qualcosa sul catalogo/preferite - descrivi SOLO questo, MAI un'alternativa inventata, "
         "NEMMENO per sembrare piu' prudente o onesto - qui sotto NON e' una capacita' vietata, e' una capacita' "
