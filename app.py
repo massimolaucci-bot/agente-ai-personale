@@ -2172,6 +2172,20 @@ GOOGLE_TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ricetta_rimuovi_preferita",
+            "description": "Rimuove per davvero una ricetta dal catalogo delle preferite, cercandola per nome. Usa questo per richieste come 'rimuovi la lasagna dalle preferite', 'togli quella ricetta dal catalogo', 'cancella i pomodori ripieni dai preferiti'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nome_piatto": {"type": "string", "description": "Nome (anche parziale) della ricetta da rimuovere dalle preferite."},
+                },
+                "required": ["nome_piatto"],
+            },
+        },
+    },
 ]
 
 
@@ -2194,12 +2208,12 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
     dismesso llama-3.3-70b-versatile), modello Groq con supporto affidabile
     per i tool personalizzati - non PRIMARY_MODEL ("groq/compound"), il cui
     comportamento con "tools" definiti da noi non e' documentato.
-    NOTA (round 20septies, valida anche per round 21 e round 22): "crea_presentazione",
+    NOTA (round 20septies, valida anche per round 21 e round 22/22quater): "crea_presentazione",
     "cerca_norma", "cerca_sentenza_costituzionale", "cerca_sentenza_cassazione",
-    "cerca_ricetta", "ricetta_salva_preferita", "ricetta_mostra_preferite" e
-    "ricetta_feedback" sono gli unici tool di questo elenco che non servono un
-    account Google - vivono comunque qui perche' e' lo stesso classificatore a
-    riconoscerli.
+    "cerca_ricetta", "ricetta_salva_preferita", "ricetta_mostra_preferite",
+    "ricetta_feedback" e "ricetta_rimuovi_preferita" sono gli unici tool di questo
+    elenco che non servono un account Google - vivono comunque qui perche' e' lo
+    stesso classificatore a riconoscerli.
     Conseguenza pratica accettata: se Google non e' configurato su questo
     server, anche queste funzioni restano disattivate insieme al resto - non
     e' un problema nella pratica (l'account condiviso di famiglia e' gia'
@@ -2988,6 +3002,41 @@ def _gestisci_ricetta_mostra_preferite(argomenti, utente):
     return "📖 Le tue ricette preferite:\n" + _elenco
 
 
+def _gestisci_ricetta_rimuovi_preferita(argomenti, utente):
+    """Rimuove per davvero una o piu' ricette dal catalogo delle preferite,
+    cercandole per nome (corrispondenza parziale, case-insensitive) - mai
+    fingendo una rimozione avvenuta se in realta' non c'era nulla da
+    cancellare. Aggiunta nel round 22quater dopo aver scoperto che la chat
+    generica, rispondendo alla domanda "cosa puoi fare con le ricette?",
+    aveva promesso questa capacita' - all'epoca non ancora costruita per
+    davvero - violando cosi' lo stesso principio anti-allucinazione che il
+    progetto vuole rispettare sempre."""
+    if not _supabase_enabled() or not utente or not utente.get("id"):
+        return "Il catalogo delle ricette preferite non e' disponibile in questo momento (problema di connessione al database)."
+    _nome = (argomenti.get("nome_piatto") or "").strip()
+    if not _nome:
+        return "Quale ricetta vuoi rimuovere dalle preferite? Dimmi il nome (anche parziale)."
+    try:
+        _r = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/ricette_preferite",
+            headers={**SUPABASE_HEADERS, "Prefer": "return=representation"},
+            params={
+                "family_user_id": f"eq.{utente.get('id')}",
+                "nome_piatto": f"ilike.*{_nome}*",
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        _righe_rimosse = _r.json() or []
+    except Exception as e:
+        print(f"[ricette] rimozione dalle preferite fallita: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a rimuovere questa ricetta dalle preferite in questo momento: riprova tra poco."
+    if not _righe_rimosse:
+        return f"Non ho trovato nessuna ricetta \"{_nome}\" tra le tue preferite da rimuovere."
+    _nomi = ", ".join(f"\"{r['nome_piatto']}\"" for r in _righe_rimosse)
+    return f"🗑️ Rimossa dalle preferite: {_nomi}."
+
+
 def _prossima_ricetta_da_chiedere(utente):
     """Trova la proposta di ricetta piu' recente ancora "in_attesa" per
     questo utente e la segna come "chiesta" (cosi' non viene richiesta di
@@ -3320,6 +3369,8 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
         return _gestisci_ricetta_mostra_preferite(argomenti, utente)
     if azione_nome == "ricetta_feedback":
         return _gestisci_ricetta_feedback(argomenti, utente)
+    if azione_nome == "ricetta_rimuovi_preferita":
+        return _gestisci_ricetta_rimuovi_preferita(argomenti, utente)
 
     if not _google_oauth_enabled():
         return "La connessione con Google non e' ancora configurata su questo server."
@@ -3553,9 +3604,11 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "dalla fonte reale, e per il contesto/occasione che l'utente indica esplicitamente (es. Natale, "
         "compleanno, dieta), se lo specifica. Si puo' rivedere il catalogo in qualsiasi momento chiedendo "
         "'mostrami le mie ricette preferite', anche filtrando per categoria o contesto (es. 'mostrami i dessert "
-        "di Natale'). Non ha NULLA a che fare con i fogli Google (quel limite riguarda solo la lista della "
-        "spesa, non le ricette): non dire mai che il catalogo delle ricette e' 'solo nella conversazione', non "
-        "menzionare mai Google Sheets/Docs/Drive parlando delle ricette."
+        "di Natale'). Si puo' anche rimuovere per davvero una ricetta dal catalogo chiedendo 'rimuovi <nome> "
+        "dalle preferite' - viene cancellata per sempre dall'archivio, mai solo finta. Non ha NULLA a che fare "
+        "con i fogli Google (quel limite riguarda solo la lista della spesa, non le ricette): non dire mai che "
+        "il catalogo delle ricette e' 'solo nella conversazione', non menzionare mai Google Sheets/Docs/Drive "
+        "parlando delle ricette."
     )
     if location_text:
         system_prompt += f"\nPosizione approssimativa dell'utente: {location_text}."
