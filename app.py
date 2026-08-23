@@ -2110,6 +2110,68 @@ GOOGLE_TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "cerca_ricetta",
+            "description": "Cerca davvero una ricetta di cucina (ingredienti reali, procedimento completo, link al video quando disponibile), tradotta in italiano. Usa questo per richieste come 'trovami una ricetta con le zucchine', 'cerca un dolce', 'che ricetta cinese mi consigli', 'un primo francese'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Nome del piatto o argomento libero, se l'utente ha chiesto un piatto specifico (es. 'tiramisu')."},
+                    "ingrediente": {"type": "string", "description": "Ingrediente principale richiesto, se la richiesta e' basata su un ingrediente (es. 'zucchine', 'pollo')."},
+                    "area": {"type": "string", "description": "Cucina/nazionalita' richiesta in inglese (es. 'Italian', 'Chinese', 'French', 'American', 'Brazilian'), se l'utente ha chiesto una cucina specifica."},
+                    "categoria": {"type": "string", "description": "Categoria richiesta in inglese (es. 'Dessert', 'Starter', 'Seafood', 'Vegetarian'), se l'utente ha chiesto un tipo di portata specifico."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ricetta_salva_preferita",
+            "description": "Salva l'ultima ricetta proposta nella lista delle ricette preferite dell'utente. Usa questo quando l'utente dice qualcosa come 'aggiungila alle mie preferite', 'salva questa ricetta', 'mi piace, tienila da parte'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "categoria": {"type": "string", "description": "Categoria indicata dall'utente per questa ricetta (es. antipasto, primo, dessert), se la specifica esplicitamente."},
+                    "contesto": {"type": "string", "description": "Contesto/occasione indicato dall'utente (es. Natale, compleanno, dieta vegetariana), SOLO se lo specifica esplicitamente - non inventarlo mai."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ricetta_mostra_preferite",
+            "description": "Mostra il catalogo delle ricette preferite gia' salvate dall'utente, eventualmente filtrato per categoria o contesto. Usa questo per richieste come 'mostrami le mie ricette preferite', 'fammi vedere i dolci di Natale che abbiamo salvato'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "categoria": {"type": "string", "description": "Categoria per cui filtrare (es. dessert, primo), se richiesta."},
+                    "contesto": {"type": "string", "description": "Contesto/occasione per cui filtrare (es. Natale, compleanno), se richiesto."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ricetta_feedback",
+            "description": "Registra la risposta dell'utente a una domanda GIA' FATTA dall'assistente su una ricetta proposta in precedenza (tipicamente 'ti e' piaciuta la ricetta che ti ho proposto? la vuoi salvare tra le preferite?'). Usa questo SOLO come risposta a quella domanda specifica, non per altre richieste sulle ricette.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "piaciuta": {"type": "boolean", "description": "true se l'utente ha detto che la ricetta gli/le e' piaciuta, false se ha detto di no."},
+                    "salva": {"type": "boolean", "description": "true se l'utente ha chiesto di salvarla tra le preferite."},
+                },
+                "required": ["piaciuta", "salva"],
+            },
+        },
+    },
 ]
 
 
@@ -2132,10 +2194,12 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
     dismesso llama-3.3-70b-versatile), modello Groq con supporto affidabile
     per i tool personalizzati - non PRIMARY_MODEL ("groq/compound"), il cui
     comportamento con "tools" definiti da noi non e' documentato.
-    NOTA (round 20septies, valida anche per round 21): "crea_presentazione",
-    "cerca_norma", "cerca_sentenza_costituzionale" e "cerca_sentenza_cassazione"
-    sono gli unici tool di questo elenco che non servono un account Google -
-    vivono comunque qui perche' e' lo stesso classificatore a riconoscerli.
+    NOTA (round 20septies, valida anche per round 21 e round 22): "crea_presentazione",
+    "cerca_norma", "cerca_sentenza_costituzionale", "cerca_sentenza_cassazione",
+    "cerca_ricetta", "ricetta_salva_preferita", "ricetta_mostra_preferite" e
+    "ricetta_feedback" sono gli unici tool di questo elenco che non servono un
+    account Google - vivono comunque qui perche' e' lo stesso classificatore a
+    riconoscerli.
     Conseguenza pratica accettata: se Google non e' configurato su questo
     server, anche queste funzioni restano disattivate insieme al resto - non
     e' un problema nella pratica (l'account condiviso di famiglia e' gia'
@@ -2516,6 +2580,440 @@ def _gestisci_cerca_sentenza_cassazione(argomenti):
     )
 
 
+# --- Ricerca ricette e catalogo preferiti (round 22, richiesta esplicita ----
+# dell'utente: "l'intelligenza deve trovare le ricette su vari siti e
+# proporle a mia moglie e mio figlio che fa il cuoco"). Ricerca fatta PRIMA
+# di scrivere questo codice (vedi piano_ricette.md, pubblicato nel Progetto
+# Claude): i siti nazionali piu' noti controllati (GialloZafferano,
+# AllRecipes, Marmiton, TudoGostoso, Xiachufang) bloccano esplicitamente
+# l'accesso automatico nel loro stesso robots.txt - GialloZafferano nomina
+# persino "Claude-Web" tra i bot vietati - leggerli con un bot violerebbe le
+# loro stesse regole, esattamente come gia' verificato per la Cassazione nel
+# round precedente. La fonte usata qui e' invece TheMealDB
+# (themealdb.com/api.php), un database di ricette con una vera API gratuita
+# pensata apposta per essere usata da applicazioni terze (termini d'uso
+# verificati dal vivo: "you can scrape, copy and modify any content returned
+# from the API"), che copre tutte le cucine richieste (italiana, cinese,
+# francese, americana, brasiliana e molte altre) e restituisce per ogni
+# piatto ingredienti/dosi reali, procedimento completo, e - quando
+# disponibile - un link YouTube reale alla preparazione. I testi arrivano in
+# inglese: vengono tradotti in italiano in modo letterale (mai riscritti
+# liberamente) sia per l'uso in chat sia per l'archivio delle preferite,
+# come richiesto esplicitamente da Massimo.
+_MEALDB_API_BASE = "https://www.themealdb.com/api/json/v1/1"
+
+# Traduzione delle categorie REALI restituite da TheMealDB (mai inventate:
+# sono le categorie vere della fonte, solo tradotte) verso l'italiano usato
+# nel catalogo delle preferite.
+_MEALDB_CATEGORIA_IT = {
+    "dessert": "dessert", "starter": "antipasto", "side": "contorno",
+    "soup": "antipasto", "breakfast": "colazione", "pasta": "primo",
+    "vegetarian": "secondo", "vegan": "secondo", "seafood": "secondo",
+    "beef": "secondo", "chicken": "secondo", "lamb": "secondo",
+    "pork": "secondo", "goat": "secondo", "miscellaneous": "altro",
+}
+
+
+def _traduci_categoria_mealdb(categoria_inglese):
+    if not categoria_inglese:
+        return None
+    return _MEALDB_CATEGORIA_IT.get((categoria_inglese or "").strip().lower(), (categoria_inglese or "").strip().lower())
+
+
+def _mealdb_dettaglio_da_lista(lista):
+    """TheMealDB: filter.php (per ingrediente/area/categoria) restituisce solo
+    id/nome/immagine, mai il procedimento completo - serve un secondo giro su
+    lookup.php per i dettagli veri. Questa funzione prende il primo
+    risultato di un filter.php e ne recupera i dettagli completi; mai un
+    procedimento inventato per aggirare la chiamata in piu'."""
+    if not lista:
+        return None
+    _id = (lista[0] or {}).get("idMeal")
+    if not _id:
+        return None
+    try:
+        _r = requests.get(f"{_MEALDB_API_BASE}/lookup.php", params={"i": _id}, timeout=10)
+        _r.raise_for_status()
+        _pasti = (_r.json() or {}).get("meals") or []
+        return _pasti[0] if _pasti else None
+    except Exception as e:
+        print(f"[ricette] lookup dettaglio MealDB fallito: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _cerca_ricetta_mealdb(query, ingrediente=None, area=None, categoria=None):
+    """Interroga davvero l'API pubblica di TheMealDB. Priorita': un
+    ingrediente/area/categoria specifici (piu' mirati) prima della ricerca
+    libera per nome. Ritorna il dizionario "meal" reale della fonte, oppure
+    None se non trova nulla o l'API non risponde - mai un piatto inventato."""
+    try:
+        if ingrediente:
+            _r = requests.get(f"{_MEALDB_API_BASE}/filter.php", params={"i": ingrediente}, timeout=10)
+            _r.raise_for_status()
+            return _mealdb_dettaglio_da_lista((_r.json() or {}).get("meals") or [])
+        if area:
+            _r = requests.get(f"{_MEALDB_API_BASE}/filter.php", params={"a": area}, timeout=10)
+            _r.raise_for_status()
+            return _mealdb_dettaglio_da_lista((_r.json() or {}).get("meals") or [])
+        if categoria:
+            _r = requests.get(f"{_MEALDB_API_BASE}/filter.php", params={"c": categoria}, timeout=10)
+            _r.raise_for_status()
+            return _mealdb_dettaglio_da_lista((_r.json() or {}).get("meals") or [])
+        if query:
+            _r = requests.get(f"{_MEALDB_API_BASE}/search.php", params={"s": query}, timeout=10)
+            _r.raise_for_status()
+            _pasti = (_r.json() or {}).get("meals") or []
+            return _pasti[0] if _pasti else None
+        return None
+    except Exception as e:
+        print(f"[ricette] _cerca_ricetta_mealdb fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _estrai_ingredienti_mealdb(pasto):
+    """Ricostruisce l'elenco ingrediente+dose dai 20 campi numerati
+    strIngredient1..20/strMeasure1..20 usati davvero dall'API - mai
+    inventando una dose che l'API non ha fornito."""
+    _righe = []
+    for _i in range(1, 21):
+        _ingr = (pasto.get(f"strIngredient{_i}") or "").strip()
+        _dose = (pasto.get(f"strMeasure{_i}") or "").strip()
+        if _ingr:
+            _righe.append(f"{_dose} {_ingr}".strip() if _dose else _ingr)
+    return _righe
+
+
+def _traduci_ricetta_in_italiano(pasto):
+    """Traduce SOLO in modo letterale (mai riscrivendo/inventando passaggi o
+    dosi) il nome, gli ingredienti e il procedimento reali restituiti da
+    TheMealDB, come richiesto esplicitamente da Massimo ("le ricette devono
+    arrivare tradotte in italiano, sia nell'archivio che per l'uso"). Ritorna
+    None se la traduzione fallisce - il chiamante deve allora mostrare
+    onestamente il testo originale invece di inventarne uno tradotto."""
+    _ingredienti_originali = _estrai_ingredienti_mealdb(pasto)
+    _prompt = (
+        "Traduci in italiano, in modo LETTERALE, senza riscrivere, aggiungere, togliere o modificare alcun "
+        "passaggio, dose o ingrediente. Non e' una richiesta creativa: e' solo una traduzione fedele.\n\n"
+        f"NOME PIATTO (inglese): {pasto.get('strMeal', '')}\n"
+        f"INGREDIENTI (inglese, uno per riga): {chr(10).join(_ingredienti_originali)}\n"
+        f"PROCEDIMENTO (inglese): {pasto.get('strInstructions', '')}\n\n"
+        "Rispondi SOLO in questo formato esatto, su tre righe, senza altro testo (il procedimento va scritto "
+        "come un unico paragrafo continuo, senza andare a capo, numerando i passaggi con '1) ... 2) ...' se utile):\n"
+        "NOME: <nome tradotto>\n"
+        "INGREDIENTI: <ingredienti tradotti, uno per voce, separati da ' | '>\n"
+        "PROCEDIMENTO: <procedimento tradotto>"
+    )
+    try:
+        _client_traduzione = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        _completamento = _client_traduzione.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=[{"role": "user", "content": _prompt}],
+            max_tokens=1500,
+        )
+        _testo = _completamento.choices[0].message.content or ""
+    except Exception as e:
+        print(f"[ricette] _traduci_ricetta_in_italiano fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+    _nome_it, _ingr_it, _proc_it = None, None, None
+    for _riga in _testo.splitlines():
+        _r = _riga.strip()
+        if _r.upper().startswith("NOME:"):
+            _nome_it = _r.split(":", 1)[1].strip()
+        elif _r.upper().startswith("INGREDIENTI:"):
+            _ingr_it = _r.split(":", 1)[1].strip()
+        elif _r.upper().startswith("PROCEDIMENTO:"):
+            _proc_it = _r.split(":", 1)[1].strip()
+    if not _proc_it:
+        return None
+    return {
+        "nome": _nome_it or pasto.get("strMeal", ""),
+        "ingredienti": _ingr_it.replace(" | ", "\n- ") if _ingr_it else "\n- ".join(_ingredienti_originali),
+        "procedimento": _proc_it,
+    }
+
+
+def _formatta_risposta_ricetta(tradotta, pasto):
+    _area = pasto.get("strArea") or ""
+    _categoria_it = _traduci_categoria_mealdb(pasto.get("strCategory"))
+    _link_video = (pasto.get("strYoutube") or "").strip()
+    _risposta = f"🍽️ **{tradotta['nome']}**"
+    if _area:
+        _risposta += f" (cucina {_area})"
+    _risposta += f"\n\nIngredienti:\n- {tradotta['ingredienti']}\n\nProcedimento:\n{tradotta['procedimento']}"
+    if _link_video:
+        _risposta += f"\n\n🎥 Video della preparazione: {_link_video}"
+    _risposta += f"\n\n_(fonte: TheMealDB" + (f", categoria {_categoria_it}" if _categoria_it else "") + ")_"
+    return _risposta
+
+
+def _salva_ricetta_proposta_in_attesa(utente, tradotta, pasto):
+    """Salva la ricetta appena proposta in una tabella di attesa, cosi' alla
+    sessione successiva si puo' chiedere se e' piaciuta senza doverla
+    ricercare/ritradurre di nuovo - mai un dato ricostruito a memoria."""
+    if not _supabase_enabled() or not utente or not utente.get("id"):
+        return
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/ricette_proposte_in_attesa",
+            headers=SUPABASE_HEADERS,
+            json={
+                "family_user_id": utente.get("id"),
+                "nome_piatto": tradotta["nome"],
+                "categoria": _traduci_categoria_mealdb(pasto.get("strCategory")),
+                "area": pasto.get("strArea"),
+                "ingredienti": tradotta["ingredienti"],
+                "procedimento": tradotta["procedimento"],
+                "link_video": (pasto.get("strYoutube") or "").strip() or None,
+                "link_fonte": "TheMealDB",
+                "stato": "in_attesa",
+            },
+            timeout=SUPABASE_TIMEOUT,
+        ).raise_for_status()
+    except Exception as e:
+        print(f"[ricette] salvataggio proposta in attesa fallito: {type(e).__name__}: {e}", flush=True)
+
+
+def _gestisci_cerca_ricetta(argomenti, utente):
+    _query = (argomenti.get("query") or "").strip()
+    _ingrediente = (argomenti.get("ingrediente") or "").strip() or None
+    _area = (argomenti.get("area") or "").strip() or None
+    _categoria = (argomenti.get("categoria") or "").strip() or None
+    if not (_query or _ingrediente or _area or _categoria):
+        return "Dimmi che tipo di ricetta cerchi: un piatto, un ingrediente, una cucina (es. cinese, francese) o un'occasione."
+
+    _pasto = _cerca_ricetta_mealdb(_query, ingrediente=_ingrediente, area=_area, categoria=_categoria)
+    if not _pasto:
+        return "Non ho trovato nessuna ricetta corrispondente in questo momento. Puoi provare con un altro ingrediente o piatto?"
+
+    _tradotta = _traduci_ricetta_in_italiano(_pasto)
+    if _tradotta:
+        _nota_traduzione = ""
+    else:
+        # Fallback onesto: mostra il testo originale invece di inventare una traduzione.
+        _tradotta = {
+            "nome": _pasto.get("strMeal", ""),
+            "ingredienti": "\n- ".join(_estrai_ingredienti_mealdb(_pasto)),
+            "procedimento": _pasto.get("strInstructions", ""),
+        }
+        _nota_traduzione = "\n\n_(non sono riuscito a tradurla in questo momento: qui il testo originale in inglese)_"
+
+    _risposta = _formatta_risposta_ricetta(_tradotta, _pasto) + _nota_traduzione
+
+    st.session_state["_ultima_ricetta_proposta"] = {
+        "nome": _tradotta["nome"],
+        "categoria": _traduci_categoria_mealdb(_pasto.get("strCategory")),
+        "area": _pasto.get("strArea"),
+        "ingredienti": _tradotta["ingredienti"],
+        "procedimento": _tradotta["procedimento"],
+        "link_video": (_pasto.get("strYoutube") or "").strip() or None,
+        "link_fonte": "TheMealDB",
+    }
+    _salva_ricetta_proposta_in_attesa(utente, _tradotta, _pasto)
+
+    if not st.session_state.get("_domanda_alimentare_fatta"):
+        st.session_state["_domanda_alimentare_fatta"] = True
+        _risposta += (
+            "\n\n🍽️ Prima di continuare: hai allergie, intolleranze o preferenze alimentari da tenere a mente per "
+            "le prossime ricette? Se vuoi che me lo ricordi sempre, scrivilo tra le \"Istruzioni permanenti\" nella "
+            "barra laterale."
+        )
+
+    _risposta += "\n\nSe ti è piaciuta, dimmi \"aggiungila alle mie preferite\"."
+    return _risposta
+
+
+def _ricetta_da_salvare_per(utente):
+    """Trova la ricetta a cui riferirsi per un salvataggio tra le preferite:
+    prima quella appena proposta in QUESTA conversazione (piu' affidabile),
+    altrimenti la piu' recente in attesa di feedback per questo utente (caso
+    del promemoria alla sessione successiva) - mai una ricetta indovinata.
+    Ritorna (dizionario_ricetta, id_riga_in_attesa_o_None)."""
+    _in_sessione = st.session_state.get("_ultima_ricetta_proposta")
+    if _in_sessione:
+        return _in_sessione, None
+    if not _supabase_enabled() or not utente or not utente.get("id"):
+        return None, None
+    try:
+        _r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ricette_proposte_in_attesa",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "*",
+                "family_user_id": f"eq.{utente.get('id')}",
+                "stato": "in.(in_attesa,chiesta)",
+                "order": "proposta_il.desc",
+                "limit": "1",
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        _righe = _r.json()
+        if not _righe:
+            return None, None
+        _riga = _righe[0]
+        return {
+            "nome": _riga["nome_piatto"],
+            "categoria": _riga.get("categoria"),
+            "area": _riga.get("area"),
+            "ingredienti": _riga.get("ingredienti"),
+            "procedimento": _riga.get("procedimento"),
+            "link_video": _riga.get("link_video"),
+            "link_fonte": _riga.get("link_fonte"),
+        }, _riga["id"]
+    except Exception as e:
+        print(f"[ricette] lettura proposta in attesa fallita: {type(e).__name__}: {e}", flush=True)
+        return None, None
+
+
+def _segna_proposta_risolta(riga_id):
+    if not _supabase_enabled() or not riga_id:
+        return
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/ricette_proposte_in_attesa",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{riga_id}"},
+            json={"stato": "risolta"},
+            timeout=SUPABASE_TIMEOUT,
+        ).raise_for_status()
+    except Exception as e:
+        print(f"[ricette] aggiornamento stato proposta fallito: {type(e).__name__}: {e}", flush=True)
+
+
+def _gestisci_ricetta_salva_preferita(argomenti, utente):
+    _ricetta, _riga_id = _ricetta_da_salvare_per(utente)
+    if not _ricetta:
+        return "Non trovo nessuna ricetta recente a cui riferirmi: cercane prima una, poi dimmi di aggiungerla alle preferite."
+    if not _supabase_enabled() or not utente or not utente.get("id"):
+        return "Il catalogo delle ricette preferite non e' disponibile in questo momento (problema di connessione al database)."
+
+    _categoria = (argomenti.get("categoria") or "").strip() or _ricetta.get("categoria")
+    _contesto = (argomenti.get("contesto") or "").strip() or None
+
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/ricette_preferite",
+            headers=SUPABASE_HEADERS,
+            json={
+                "family_user_id": utente.get("id"),
+                "nome_piatto": _ricetta["nome"],
+                "categoria": _categoria,
+                "contesto": _contesto,
+                "area": _ricetta.get("area"),
+                "ingredienti": _ricetta.get("ingredienti"),
+                "procedimento": _ricetta.get("procedimento"),
+                "link_video": _ricetta.get("link_video"),
+                "link_fonte": _ricetta.get("link_fonte") or "TheMealDB",
+            },
+            timeout=SUPABASE_TIMEOUT,
+        ).raise_for_status()
+    except Exception as e:
+        print(f"[ricette] salvataggio tra preferite fallito: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a salvare questa ricetta tra le preferite in questo momento: riprova tra poco."
+
+    if _riga_id:
+        _segna_proposta_risolta(_riga_id)
+    st.session_state["_ultima_ricetta_proposta"] = None
+    return f"✅ \"{_ricetta['nome']}\" aggiunta alle tue ricette preferite" + (f" (categoria: {_categoria})" if _categoria else "") + "."
+
+
+def _gestisci_ricetta_feedback(argomenti, utente):
+    """Gestisce la risposta dell'utente alla domanda proattiva mostrata
+    all'ingresso in una nuova conversazione ("ti e' piaciuta la ricetta che
+    ti ho proposto?"). Se ha detto di si' e di volerla salvare, la salva
+    davvero tra le preferite; altrimenti chiude semplicemente la richiesta
+    in attesa, senza inventare nulla."""
+    _piaciuta = argomenti.get("piaciuta")
+    _salva = bool(argomenti.get("salva"))
+    if _piaciuta and _salva:
+        return _gestisci_ricetta_salva_preferita(argomenti, utente)
+    _, _riga_id = _ricetta_da_salvare_per(utente)
+    if _riga_id:
+        _segna_proposta_risolta(_riga_id)
+    st.session_state["_ultima_ricetta_proposta"] = None
+    if _piaciuta is False:
+        return "Va bene, grazie per il feedback: terrò conto che questa non ti è piaciuta."
+    return "Va bene, grazie per il feedback!"
+
+
+def _gestisci_ricetta_mostra_preferite(argomenti, utente):
+    if not _supabase_enabled() or not utente or not utente.get("id"):
+        return "Il catalogo delle ricette preferite non e' disponibile in questo momento (problema di connessione al database)."
+    _categoria = (argomenti.get("categoria") or "").strip() or None
+    _contesto = (argomenti.get("contesto") or "").strip() or None
+    try:
+        _params = {
+            "select": "nome_piatto,categoria,contesto,area,link_video,created_at",
+            "family_user_id": f"eq.{utente.get('id')}",
+            "order": "created_at.desc",
+            "limit": "50",
+        }
+        if _categoria:
+            _params["categoria"] = f"ilike.*{_categoria}*"
+        if _contesto:
+            _params["contesto"] = f"ilike.*{_contesto}*"
+        _r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ricette_preferite",
+            headers=SUPABASE_HEADERS,
+            params=_params,
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        _righe = _r.json()
+    except Exception as e:
+        print(f"[ricette] lettura catalogo preferite fallita: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a leggere il catalogo delle ricette preferite in questo momento."
+
+    if not _righe:
+        _filtro = _categoria or _contesto
+        return "Non ci sono ancora ricette salvate tra le preferite" + (f" per \"{_filtro}\"" if _filtro else "") + "."
+
+    _elenco = "\n".join(
+        f"- {r['nome_piatto']}" + (f" ({r['categoria']}" + (f", {r['contesto']}" if r.get('contesto') else "") + ")" if r.get('categoria') else "")
+        for r in _righe
+    )
+    return "📖 Le tue ricette preferite:\n" + _elenco
+
+
+def _prossima_ricetta_da_chiedere(utente):
+    """Trova la proposta di ricetta piu' recente ancora "in_attesa" per
+    questo utente e la segna come "chiesta" (cosi' non viene richiesta di
+    nuovo al prossimo accesso). Ritorna la riga trovata, o None se non c'e'
+    nessuna domanda in sospeso - mai una domanda su una ricetta inventata."""
+    if not _supabase_enabled() or not utente or not utente.get("id"):
+        return None
+    try:
+        _r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ricette_proposte_in_attesa",
+            headers=SUPABASE_HEADERS,
+            params={
+                "select": "*",
+                "family_user_id": f"eq.{utente.get('id')}",
+                "stato": "eq.in_attesa",
+                "order": "proposta_il.desc",
+                "limit": "1",
+            },
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        _righe = _r.json()
+        if not _righe:
+            return None
+        _riga = _righe[0]
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/ricette_proposte_in_attesa",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{_riga['id']}"},
+            json={"stato": "chiesta"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        return _riga
+    except Exception as e:
+        print(f"[ricette] ricerca proposta da chiedere fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
 # --- Composizione email guidata a stati (round 19bis, richiesta esplicita ---
 # dell'utente): il vecchio flusso lasciava a Groq (function calling) la
 # decisione di quando un'email era "pronta" da inviare, in un solo passaggio
@@ -2788,12 +3286,12 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
     # sarebbe stato piu' fragile che tenerle separate cosi'.
     argomenti = argomenti or {}
 
-    # "crea_presentazione" (round 20septies) e "cerca_norma" /
+    # "crea_presentazione" (round 20septies), "cerca_norma" /
     # "cerca_sentenza_costituzionale" / "cerca_sentenza_cassazione" (round
-    # 21) sono le uniche azioni di questo elenco che NON toccano Google:
-    # vanno gestite PRIMA del controllo OAuth/credenziali qui sotto,
-    # altrimenti fallirebbero a chiedere un collegamento Google che non gli
-    # serve affatto.
+    # 21) e le quattro azioni sulle ricette (round 22) sono le uniche azioni
+    # di questo elenco che NON toccano Google: vanno gestite PRIMA del
+    # controllo OAuth/credenziali qui sotto, altrimenti fallirebbero a
+    # chiedere un collegamento Google che non gli serve affatto.
     if azione_nome == "crea_presentazione":
         return _gestisci_crea_presentazione(argomenti)
     if azione_nome == "cerca_norma":
@@ -2802,6 +3300,14 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
         return _gestisci_cerca_sentenza_costituzionale(argomenti)
     if azione_nome == "cerca_sentenza_cassazione":
         return _gestisci_cerca_sentenza_cassazione(argomenti)
+    if azione_nome == "cerca_ricetta":
+        return _gestisci_cerca_ricetta(argomenti, utente)
+    if azione_nome == "ricetta_salva_preferita":
+        return _gestisci_ricetta_salva_preferita(argomenti, utente)
+    if azione_nome == "ricetta_mostra_preferite":
+        return _gestisci_ricetta_mostra_preferite(argomenti, utente)
+    if azione_nome == "ricetta_feedback":
+        return _gestisci_ricetta_feedback(argomenti, utente)
 
     if not _google_oauth_enabled():
         return "La connessione con Google non e' ancora configurata su questo server."
@@ -3010,7 +3516,9 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "foglio Google dedicato - SOLO quella lista, nessun altro contenuto puo' finire li' dentro - verbali audio "
         "con Google Doc + promemoria, creazione di presentazioni PowerPoint scaricabili con contenuto vero, ricerca "
         "vera di norme/leggi su Normattiva, link di ricerca reali per sentenze della Corte Costituzionale e della "
-        "Cassazione) - se stai rispondendo tu in questa chat generica, quei comandi non si sono attivati (puo' "
+        "Cassazione, ricerca vera di ricette di cucina con ingredienti/procedimento reali tradotti in italiano e "
+        "catalogo delle ricette preferite) - se stai rispondendo tu in questa chat generica, quei comandi non si "
+        "sono attivati (puo' "
         "succedere anche se manca l'argomento/la query: in quel caso il comando dedicato avrebbe gia' chiesto il "
         "dettaglio mancante, quindi fallo anche tu). Se l'utente chiede qualcosa che non sai davvero fare "
         "(es. un foglio Google generico, un documento Google Docs, qualsiasi altro file scaricabile diverso da una "
@@ -4002,6 +4510,24 @@ if st.session_state.get("just_logged_in"):
             if MEMORIA_PERSISTENTE:
                 st.session_state.conversation_id = _create_conversation(_nome_utente)
             st.session_state.messages = []
+            st.session_state["_ultima_ricetta_proposta"] = None
+            st.session_state["_domanda_alimentare_fatta"] = False
+            # Round 22, richiesta esplicita di Massimo: se l'ultima volta era
+            # stata proposta una ricetta e non e' ancora stato chiesto se e'
+            # piaciuta, lo si chiede ora, all'apertura di questa nuova
+            # conversazione ("alla sessione successiva"). Mai una domanda su
+            # una ricetta inventata: solo se esiste davvero una proposta in
+            # attesa per QUESTO utente, salvata quando la ricetta e' stata
+            # mostrata la volta precedente.
+            _ricetta_da_chiedere = _prossima_ricetta_da_chiedere(st.session_state.current_user)
+            if _ricetta_da_chiedere:
+                _domanda = (
+                    f"🍽️ Prima di iniziare: ti è piaciuta la ricetta \"{_ricetta_da_chiedere['nome_piatto']}\" che ti "
+                    "avevo proposto l'ultima volta? Se sì, la vuoi aggiungere alle tue ricette preferite?"
+                )
+                st.session_state.messages.append({"role": "assistant", "content": _domanda})
+                if MEMORIA_PERSISTENTE:
+                    _append_message(st.session_state.conversation_id, "assistant", _domanda)
             st.rerun()
     st.stop()
 
