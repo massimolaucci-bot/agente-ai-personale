@@ -2672,9 +2672,14 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
     gia' concesso per la lista della spesa: "spreadsheets"/"documents"/
     "drive.file"), quindi passano dal normale controllo OAuth qui sotto come
     tutte le altre azioni Google. "mostra_file_google_creati" (round 23,
-    terza parte) non chiama mai l'API Google (legge solo Supabase), ma resta
-    comunque raggruppata con le altre azioni sui file Google per coerenza
-    architetturale, quindi passa anch'essa dal controllo OAuth generico.
+    terza parte) non chiama mai l'API Google (legge solo Supabase): fino al
+    round 23quater restava comunque raggruppata con le altre azioni sui file
+    Google "per coerenza architetturale", ma la verifica live ha trovato un
+    bug reale causato proprio da questo - se le credenziali Google non
+    erano disponibili (es. token scaduto), l'utente riceveva un fuorviante
+    "non riesco ad accedere al tuo account Google" per un comando che non
+    dipende affatto da Google. Dal round 23quinquies e' quindi gestita
+    PRIMA del controllo OAuth, insieme alle azioni sull'anagrafica ospiti.
     "aggiungi_ospite"/"mostra_ospiti"/"rimuovi_ospite" (round 23, terza
     parte) non servono MAI un account Google (pura lettura/scrittura
     Supabase): vivono qui insieme alle ricette perche' e' lo stesso
@@ -4072,11 +4077,17 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
     # comunque corretto gestirla qui, prima del controllo generico sotto),
     # "cerca_norma" / "cerca_sentenza_costituzionale" /
     # "cerca_sentenza_cassazione" (round 21), le quattro azioni sulle
-    # ricette (round 22) e le tre azioni sull'anagrafica ospiti (round 23
-    # terza parte, pura lettura/scrittura Supabase, nessun account Google
-    # coinvolto) sono le uniche azioni di questo elenco gestite PRIMA del
-    # controllo OAuth/credenziali generico qui sotto (le altre lo
-    # richiedono sempre, queste no o lo gestiscono da sole).
+    # ricette (round 22), le tre azioni sull'anagrafica ospiti e
+    # "mostra_file_google_creati" (round 23 terza parte; spostata qui nel
+    # round 23quinquies - BUG REALE trovato in verifica live: prima stava
+    # nel blocco sotto "per coerenza architetturale" pur non chiamando MAI
+    # l'API Google, e quando le credenziali Google non erano disponibili
+    # [es. token scaduto] l'utente riceveva "non riesco ad accedere al tuo
+    # account Google" anche se la lista viene letta SOLO da Supabase - un
+    # errore fuorviante per un comando che non dipende affatto da Google)
+    # sono le uniche azioni di questo elenco gestite PRIMA del controllo
+    # OAuth/credenziali generico qui sotto (le altre lo richiedono sempre,
+    # queste no o lo gestiscono da sole).
     if azione_nome == "crea_presentazione":
         return _gestisci_crea_presentazione(argomenti, utente, testo_completo)
     if azione_nome == "cerca_norma":
@@ -4101,6 +4112,8 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
         return _gestisci_mostra_ospiti(argomenti, utente)
     if azione_nome == "rimuovi_ospite":
         return _gestisci_rimuovi_ospite(argomenti, utente)
+    if azione_nome == "mostra_file_google_creati":
+        return _gestisci_mostra_file_google_creati(argomenti)
 
     if not _google_oauth_enabled():
         return "La connessione con Google non e' ancora configurata su questo server."
@@ -4141,9 +4154,6 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
 
     if azione_nome == "condividi_file_google":
         return _gestisci_condividi_file_google(argomenti, utente)
-
-    if azione_nome == "mostra_file_google_creati":
-        return _gestisci_mostra_file_google_creati(argomenti)
 
     if azione_nome == "leggi_calendario":
         eventi = _list_calendar_events(creds, max_results=10)
