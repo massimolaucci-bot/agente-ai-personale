@@ -1592,6 +1592,34 @@ def _trova_file_google_recente(titolo_riferimento=None):
         return None
 
 
+_TIPI_FILE_GOOGLE_VALIDI = ("foglio", "documento", "presentazione")
+
+
+def _lista_file_google_creati(tipo_filtro=None, limite=15):
+    """Round 23 (comando su richiesta, mai mostrato in automatico): elenca i
+    file Google creati davvero dall'app tramite google_file_creati, i piu'
+    recenti prima. Se tipo_filtro e' dato (foglio/documento/presentazione),
+    filtra solo quel tipo. Ritorna una lista di righe reali (mai inventate),
+    o [] se non c'e' nulla o la query fallisce - mai un elenco finto."""
+    if not _supabase_enabled():
+        return []
+    try:
+        _params = {"select": "*", "order": "creato_il.desc", "limit": str(limite)}
+        if tipo_filtro in _TIPI_FILE_GOOGLE_VALIDI:
+            _params["tipo"] = f"eq.{tipo_filtro}"
+        _r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/google_file_creati",
+            headers=SUPABASE_HEADERS,
+            params=_params,
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        return _r.json() or []
+    except Exception as e:
+        print(f"[google_file] lista file creati fallita: {type(e).__name__}: {e}", flush=True)
+        return []
+
+
 def _genera_contenuto_foglio(titolo, descrizione):
     """Quando l'utente non da' righe/colonne precise ma solo una descrizione
     libera (es. "un sondaggio per i gusti di gelato preferiti"), chiede a
@@ -1800,6 +1828,38 @@ def _gestisci_condividi_file_google(argomenti, utente):
         return f"Non sono riuscito a condividerlo con {_email}: riprova tra poco."
 
     return f"✅ \"{_riga['titolo']}\" condiviso davvero con {_email} (arrivera' anche una notifica via email da Google)."
+
+
+_ETICHETTA_TIPO_FILE_GOOGLE = {"foglio": "Foglio", "documento": "Documento", "presentazione": "Presentazione"}
+_ETICHETTA_TIPO_FILE_GOOGLE_PLURALE = {"foglio": "fogli", "documento": "documenti", "presentazione": "presentazioni"}
+
+
+def _gestisci_mostra_file_google_creati(argomenti):
+    """Round 23: comando SOLO su richiesta esplicita dell'utente (mai
+    mostrato in automatico dopo una creazione o altrove) - elenca i file
+    Google (Fogli/Documenti/Presentazioni) creati davvero dall'app, con
+    titolo, tipo e link di download reale se disponibile. Mai un elenco
+    inventato: se non c'e' nulla, lo dice onestamente."""
+    _tipo_filtro = (argomenti.get("tipo") or "").strip().lower() or None
+    if _tipo_filtro and _tipo_filtro not in _TIPI_FILE_GOOGLE_VALIDI:
+        _tipo_filtro = None
+    _righe = _lista_file_google_creati(_tipo_filtro)
+    if not _righe:
+        if _tipo_filtro:
+            return f"Non risulta ancora nessun {_ETICHETTA_TIPO_FILE_GOOGLE[_tipo_filtro].lower()} creato tramite l'assistente."
+        return "Non risulta ancora nessun file Google creato tramite l'assistente."
+
+    _elenco = []
+    for _r in _righe:
+        _etichetta_tipo = _ETICHETTA_TIPO_FILE_GOOGLE.get(_r.get("tipo"), _r.get("tipo") or "File")
+        _data = (_r.get("creato_il") or "")[:10]
+        _riga_testo = f"- {_etichetta_tipo} \"{_r.get('titolo') or 'senza titolo'}\" ({_data})"
+        if _r.get("link_download"):
+            _riga_testo += f" — 📥 {_r['link_download']}"
+        _elenco.append(_riga_testo)
+
+    _intestazione = "Ecco i file Google creati piu' di recente" + (f" (solo {_ETICHETTA_TIPO_FILE_GOOGLE_PLURALE[_tipo_filtro]})" if _tipo_filtro else "") + ":\n"
+    return _intestazione + "\n".join(_elenco)
 
 
 # --- Verbali audio: un messaggio vocale che inizia con "verbale" (stessa
@@ -2524,6 +2584,58 @@ GOOGLE_TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "mostra_file_google_creati",
+            "description": "Elenca i Fogli/Documenti/Presentazioni Google creati davvero dall'app tramite l'assistente (titolo, tipo, link di download), i piu' recenti prima. Usa questo SOLO quando l'utente chiede esplicitamente di vedere/elencare i file creati (es. 'che file hai creato', 'mostrami i fogli Google che hai fatto', 'elenco dei documenti creati') - MAI mostrarlo di tua iniziativa dopo aver creato un file o in altre occasioni: va sempre chiesto esplicitamente dall'utente.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tipo": {"type": "string", "enum": ["foglio", "documento", "presentazione"], "description": "Filtra solo un tipo, SOLO se l'utente lo specifica esplicitamente (es. 'che presentazioni hai creato'); altrimenti lascia vuoto per vederli tutti."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "aggiungi_ospite",
+            "description": "Aggiunge o aggiorna un ospite nell'anagrafica di famiglia, con eventuali intolleranze/preferenze alimentari (es. 'Carlo non mangia i funghi', 'aggiungi Maria alle intolleranze, e' celiaca'). Se un ospite con lo stesso nome esiste gia', aggiorna le sue note invece di crearne uno doppio. Chiunque in famiglia puo' usarlo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nome": {"type": "string", "description": "Nome dell'ospite, cosi' come lo scrive l'utente."},
+                    "note": {"type": "string", "description": "Intolleranze/preferenze/allergie alimentari dette dall'utente, riportate fedelmente (non riscritte/interpretate). Se l'utente aggiunge solo il nome senza specificare nulla, lascia vuoto."},
+                    "email": {"type": "string", "description": "Indirizzo email dell'ospite, SOLO se l'utente lo scrive per esteso in questo messaggio - non inventarlo mai, lascia vuoto se non c'e'."},
+                },
+                "required": ["nome"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mostra_ospiti",
+            "description": "Mostra l'elenco degli ospiti salvati in anagrafica, con le eventuali intolleranze/preferenze note. Usa questo quando l'utente chiede di vedere/ricordare gli ospiti o le loro intolleranze (es. 'chi ha intolleranze tra i nostri ospiti', 'mostrami gli ospiti salvati', 'cosa non mangia Carlo').",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rimuovi_ospite",
+            "description": "Rimuove per sempre un ospite dall'anagrafica. Usa questo SOLO quando l'utente chiede esplicitamente di rimuovere/cancellare un ospite specifico per nome.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nome": {"type": "string", "description": "Nome esatto (o molto simile) dell'ospite da rimuovere, cosi' come lo scrive l'utente."},
+                },
+                "required": ["nome"],
+            },
+        },
+    },
 ]
 
 
@@ -2559,7 +2671,14 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
     "condividi_file_google" SERVONO invece un account Google (stesso scope
     gia' concesso per la lista della spesa: "spreadsheets"/"documents"/
     "drive.file"), quindi passano dal normale controllo OAuth qui sotto come
-    tutte le altre azioni Google.
+    tutte le altre azioni Google. "mostra_file_google_creati" (round 23,
+    terza parte) non chiama mai l'API Google (legge solo Supabase), ma resta
+    comunque raggruppata con le altre azioni sui file Google per coerenza
+    architetturale, quindi passa anch'essa dal controllo OAuth generico.
+    "aggiungi_ospite"/"mostra_ospiti"/"rimuovi_ospite" (round 23, terza
+    parte) non servono MAI un account Google (pura lettura/scrittura
+    Supabase): vivono qui insieme alle ricette perche' e' lo stesso
+    classificatore a riconoscerle.
     Conseguenza pratica accettata: se Google non e' configurato su questo
     server, anche queste funzioni restano disattivate insieme al resto - non
     e' un problema nella pratica (l'account condiviso di famiglia e' gia'
@@ -2590,7 +2709,13 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
         "crea_presentazione, sia che l'utente dica esplicitamente 'PowerPoint' o 'Google Slides'/'presentazione "
         "Google' (allora imposta il parametro 'formato' di conseguenza), sia che non specifichi il formato "
         "(allora lascia 'formato' vuoto: sara' il tool stesso a chiederlo, non indovinarlo mai tu qui). Resta un "
-        "limite reale solo qualunque file su un servizio diverso da Google/PowerPoint.\n"
+        "limite reale solo qualunque file su un servizio diverso da Google/PowerPoint. Una richiesta di VEDERE/"
+        "ELENCARE i file Google gia' creati (es. 'che file hai creato', 'mostrami i fogli fatti') VA riconosciuta "
+        "con mostra_file_google_creati, ma SOLO quando l'utente lo chiede esplicitamente lui - non chiamarlo mai "
+        "di tua iniziativa dopo aver creato un file. Una richiesta di salvare/aggiornare un ospite e le sue "
+        "intolleranze/preferenze (es. 'Carlo non mangia i funghi', 'aggiungi Maria agli ospiti') VA riconosciuta "
+        "con aggiungi_ospite; di vedere gli ospiti salvati con mostra_ospiti; di rimuoverne uno con "
+        "rimuovi_ospite.\n"
         "4. Non inventare MAI un indirizzo email, un nome file, un articolo o un argomento di presentazione che non "
         "compare nel messaggio o nella cronologia recente: se manca, chiedilo (regola 2).\n"
         "5. Per motivi di sicurezza, un indirizzo email per scrivere/rispondere a una mail viene accettato SOLO se "
@@ -3526,6 +3651,146 @@ def _prossima_ricetta_da_chiedere(utente):
         return None
 
 
+# --- Anagrafica ospiti (round 23, terza parte, richiesta esplicita di -------
+# Massimo): memoria semplice di nome + intolleranze/preferenze alimentari
+# degli ospiti di famiglia (es. "Carlo non mangia i funghi"), condivisa da
+# tutta la famiglia (chiunque puo' aggiungere/consultare, non e' legata a un
+# singolo utente come le ricette preferite). Pensata per essere riusata in
+# futuro da altre funzioni (menu, inviti) senza dover essere ricostruita.
+def _trova_ospite_per_nome(nome):
+    """Cerca un ospite gia' salvato per nome (case-insensitive, corrispondenza
+    esatta prima, poi parziale) - usata per capire se "aggiungi ospite" deve
+    aggiornare una riga gia' esistente invece di crearne una doppia. Ritorna
+    la riga trovata o None."""
+    if not _supabase_enabled() or not nome:
+        return None
+    try:
+        _r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ospiti",
+            headers=SUPABASE_HEADERS,
+            params={"select": "*", "nome": f"ilike.{nome}", "limit": "1"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        _righe = _r.json()
+        if _righe:
+            return _righe[0]
+        _r2 = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ospiti",
+            headers=SUPABASE_HEADERS,
+            params={"select": "*", "nome": f"ilike.*{nome}*", "limit": "1"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r2.raise_for_status()
+        _righe2 = _r2.json()
+        return _righe2[0] if _righe2 else None
+    except Exception as e:
+        print(f"[ospiti] ricerca per nome fallita: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _gestisci_aggiungi_ospite(argomenti, utente):
+    if not _supabase_enabled():
+        return "L'anagrafica ospiti non e' disponibile in questo momento (problema di connessione al database)."
+    _nome = (argomenti.get("nome") or "").strip()
+    if not _nome:
+        return "Come si chiama l'ospite da aggiungere?"
+    _note = (argomenti.get("note") or "").strip() or None
+    _email = (argomenti.get("email") or "").strip() or None
+    if _email and "@" not in _email:
+        _email = None
+
+    _esistente = _trova_ospite_per_nome(_nome)
+    try:
+        if _esistente:
+            # Aggiorna solo i campi davvero forniti in questo messaggio,
+            # senza cancellare note/email gia' salvate in precedenza se ora
+            # l'utente non le ripete.
+            _corpo = {"aggiornato_il": "now()"}
+            if _note:
+                _corpo["note"] = _note
+            if _email:
+                _corpo["email"] = _email
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/ospiti",
+                headers=SUPABASE_HEADERS,
+                params={"id": f"eq.{_esistente['id']}"},
+                json=_corpo,
+                timeout=SUPABASE_TIMEOUT,
+            ).raise_for_status()
+            _msg = f"✅ Aggiornato \"{_nome}\" nell'anagrafica ospiti"
+        else:
+            requests.post(
+                f"{SUPABASE_URL}/rest/v1/ospiti",
+                headers=SUPABASE_HEADERS,
+                json={
+                    "nome": _nome,
+                    "note": _note,
+                    "email": _email,
+                    "aggiunto_da_id": (utente or {}).get("id"),
+                },
+                timeout=SUPABASE_TIMEOUT,
+            ).raise_for_status()
+            _msg = f"✅ Aggiunto \"{_nome}\" all'anagrafica ospiti"
+    except Exception as e:
+        print(f"[ospiti] salvataggio fallito: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a salvare questo ospite in questo momento: riprova tra poco."
+
+    if _note:
+        _msg += f" (note: {_note})"
+    return _msg + "."
+
+
+def _gestisci_mostra_ospiti(argomenti, utente):
+    if not _supabase_enabled():
+        return "L'anagrafica ospiti non e' disponibile in questo momento (problema di connessione al database)."
+    try:
+        _r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ospiti",
+            headers=SUPABASE_HEADERS,
+            params={"select": "*", "order": "nome.asc", "limit": "200"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        _righe = _r.json()
+    except Exception as e:
+        print(f"[ospiti] lettura anagrafica fallita: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a leggere l'anagrafica ospiti in questo momento."
+
+    if not _righe:
+        return "Non ci sono ancora ospiti salvati in anagrafica."
+
+    _elenco = "\n".join(
+        f"- {r['nome']}" + (f": {r['note']}" if r.get("note") else "") + (f" ({r['email']})" if r.get("email") else "")
+        for r in _righe
+    )
+    return "👥 Ospiti salvati in anagrafica:\n" + _elenco
+
+
+def _gestisci_rimuovi_ospite(argomenti, utente):
+    if not _supabase_enabled():
+        return "L'anagrafica ospiti non e' disponibile in questo momento (problema di connessione al database)."
+    _nome = (argomenti.get("nome") or "").strip()
+    if not _nome:
+        return "Quale ospite vuoi rimuovere dall'anagrafica? Dimmi il nome."
+    try:
+        _r = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/ospiti",
+            headers={**SUPABASE_HEADERS, "Prefer": "return=representation"},
+            params={"nome": f"ilike.*{_nome}*"},
+            timeout=SUPABASE_TIMEOUT,
+        )
+        _r.raise_for_status()
+        _righe_rimosse = _r.json() or []
+    except Exception as e:
+        print(f"[ospiti] rimozione fallita: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a rimuovere questo ospite in questo momento: riprova tra poco."
+    if not _righe_rimosse:
+        return f"Non ho trovato nessun ospite \"{_nome}\" in anagrafica da rimuovere."
+    _nomi = ", ".join(f"\"{r['nome']}\"" for r in _righe_rimosse)
+    return f"🗑️ Rimosso dall'anagrafica ospiti: {_nomi}."
+
+
 # --- Composizione email guidata a stati (round 19bis, richiesta esplicita ---
 # dell'utente): il vecchio flusso lasciava a Groq (function calling) la
 # decisione di quando un'email era "pronta" da inviare, in un solo passaggio
@@ -3804,9 +4069,11 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
     # ramo - per il ramo "powerpoint" non serve Google affatto, quindi resta
     # comunque corretto gestirla qui, prima del controllo generico sotto),
     # "cerca_norma" / "cerca_sentenza_costituzionale" /
-    # "cerca_sentenza_cassazione" (round 21) e le quattro azioni sulle
-    # ricette (round 22) sono le uniche azioni di questo elenco gestite
-    # PRIMA del controllo OAuth/credenziali generico qui sotto (le altre lo
+    # "cerca_sentenza_cassazione" (round 21), le quattro azioni sulle
+    # ricette (round 22) e le tre azioni sull'anagrafica ospiti (round 23
+    # terza parte, pura lettura/scrittura Supabase, nessun account Google
+    # coinvolto) sono le uniche azioni di questo elenco gestite PRIMA del
+    # controllo OAuth/credenziali generico qui sotto (le altre lo
     # richiedono sempre, queste no o lo gestiscono da sole).
     if azione_nome == "crea_presentazione":
         return _gestisci_crea_presentazione(argomenti, utente, testo_completo)
@@ -3826,6 +4093,12 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
         return _gestisci_ricetta_feedback(argomenti, utente)
     if azione_nome == "ricetta_rimuovi_preferita":
         return _gestisci_ricetta_rimuovi_preferita(argomenti, utente)
+    if azione_nome == "aggiungi_ospite":
+        return _gestisci_aggiungi_ospite(argomenti, utente)
+    if azione_nome == "mostra_ospiti":
+        return _gestisci_mostra_ospiti(argomenti, utente)
+    if azione_nome == "rimuovi_ospite":
+        return _gestisci_rimuovi_ospite(argomenti, utente)
 
     if not _google_oauth_enabled():
         return "La connessione con Google non e' ancora configurata su questo server."
@@ -3866,6 +4139,9 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
 
     if azione_nome == "condividi_file_google":
         return _gestisci_condividi_file_google(argomenti, utente)
+
+    if azione_nome == "mostra_file_google_creati":
+        return _gestisci_mostra_file_google_creati(argomenti)
 
     if azione_nome == "leggi_calendario":
         eventi = _list_calendar_events(creds, max_results=10)
@@ -4048,7 +4324,9 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "sempre quale dei due formati l'utente vuole, mai indovinato), ricerca vera di norme/leggi su Normattiva, "
         "link di ricerca reali per sentenze della Corte Costituzionale e della Cassazione, ricerca vera di "
         "ricette di cucina con ingredienti/procedimento reali tradotti in italiano e catalogo delle ricette "
-        "preferite) - se stai rispondendo tu in questa chat generica, quei comandi non si sono attivati (puo' "
+        "preferite, elenco su richiesta dei file Google creati (vedi dettaglio esatto sotto), anagrafica ospiti "
+        "con le loro intolleranze/preferenze alimentari (vedi dettaglio esatto sotto)) - se stai rispondendo tu "
+        "in questa chat generica, quei comandi non si sono attivati (puo' "
         "succedere anche se manca l'argomento/la query: in quel caso il comando dedicato avrebbe gia' chiesto il "
         "dettaglio mancante, quindi fallo anche tu). Se l'utente chiede qualcosa che non sai davvero fare "
         "(oggi, l'unico limite reale rimasto e' qualunque file su un servizio diverso da Google/PowerPoint), "
@@ -4094,6 +4372,23 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "con i fogli Google (quel limite riguarda solo la lista della spesa, non le ricette): non dire mai che "
         "il catalogo delle ricette e' 'solo nella conversazione', non menzionare mai Google Sheets/Docs/Drive "
         "parlando delle ricette."
+        "\n\nDETTAGLIO ESATTO SULL'ELENCO DEI FILE GOOGLE CREATI (round 23, terza parte): l'app puo' elencare "
+        "DAVVERO tutti i Fogli/Documenti/Presentazioni Google creati tramite l'assistente (titolo, tipo, link di "
+        "download), i piu' recenti prima, SOLO quando l'utente lo chiede esplicitamente (es. 'che file hai "
+        "creato', 'mostrami i fogli fatti finora') - non menzionarlo mai di tua iniziativa dopo aver creato o "
+        "descritto un file, va sempre chiesto esplicitamente dall'utente."
+        "\n\nDETTAGLIO ESATTO SULL'ANAGRAFICA OSPITI (round 23, terza parte, obbligatorio se ti viene chiesto "
+        "cosa sai fare con gli ospiti o le loro intolleranze - descrivi SOLO questo, MAI un'alternativa "
+        "inventata): l'app tiene DAVVERO un archivio di famiglia (condiviso, non legato a un singolo utente) con "
+        "nome ed eventuali intolleranze/preferenze/allergie alimentari di ogni ospite, salvato per sempre nel "
+        "database - resta anche dopo che la chat si azzera o Render riavvia il servizio. Chiunque in famiglia "
+        "puo' aggiungere un ospite o aggiornarne le note (es. 'Carlo non mangia i funghi'): se il nome esiste "
+        "gia', le note vengono aggiornate invece di creare un doppione. Si puo' salvare anche un indirizzo email "
+        "dell'ospite, solo se scritto per esteso dall'utente. Si puo' rivedere l'intero elenco chiedendo "
+        "'mostrami gli ospiti' o 'chi ha intolleranze', e rimuovere per davvero un ospite chiedendo di rimuoverlo "
+        "per nome - viene cancellato per sempre, mai solo finto. Non esiste ancora nessun collegamento automatico "
+        "tra questa anagrafica e ricette/lista della spesa/calendario/inviti via email: quell'integrazione non e' "
+        "ancora stata costruita, non promettere che avvenga gia' in automatico."
     )
     if location_text:
         system_prompt += f"\nPosizione approssimativa dell'utente: {location_text}."
