@@ -2412,9 +2412,9 @@ GOOGLE_TOOLS_SCHEMA = [
                 "properties": {
                     "titolo": {"type": "string", "description": "Titolo breve della presentazione."},
                     "argomento": {"type": "string", "description": "Di cosa deve parlare la presentazione: l'argomento e ogni indicazione utile data dall'utente su cosa includere."},
-                    "formato": {"type": "string", "enum": ["powerpoint", "slides_google"], "description": "Formato scelto DALL'UTENTE per il file: 'powerpoint' per un file .pptx scaricabile (non richiede Google), 'slides_google' per una vera presentazione Google Slides nativa (richiede account Google collegato). Imposta questo parametro SOLO se l'utente lo specifica esplicitamente (es. dice 'PowerPoint' o 'Google Slides'/'presentazione Google') - se non lo specifica, lascialo vuoto: verra' chiesto esplicitamente quale formato vuole, non va mai indovinato."},
+                    "formato": {"type": "string", "enum": ["powerpoint", "slides_google", "non_specificato"], "description": "Formato scelto DALL'UTENTE per il file: 'powerpoint' per un file .pptx scaricabile (non richiede Google), 'slides_google' per una vera presentazione Google Slides nativa (richiede account Google collegato), 'non_specificato' se l'utente NON lo dice esplicitamente (es. non dice ne' 'PowerPoint' ne' 'Google Slides'/'presentazione Google') - in quel caso verra' chiesto esplicitamente quale formato vuole, non va mai indovinato. Questo campo e' SEMPRE richiesto: usa 'non_specificato', mai lasciarlo vuoto o nullo."},
                 },
-                "required": ["titolo", "argomento"],
+                "required": ["titolo", "argomento", "formato"],
             },
         },
     },
@@ -2592,9 +2592,9 @@ GOOGLE_TOOLS_SCHEMA = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "tipo": {"type": "string", "enum": ["foglio", "documento", "presentazione"], "description": "Filtra solo un tipo, SOLO se l'utente lo specifica esplicitamente (es. 'che presentazioni hai creato'); altrimenti lascia vuoto per vederli tutti."},
+                    "tipo": {"type": "string", "enum": ["foglio", "documento", "presentazione", "tutti"], "description": "Filtra solo un tipo, SOLO se l'utente lo specifica esplicitamente (es. 'che presentazioni hai creato'); altrimenti usa 'tutti' per vederli tutti. Questo campo e' SEMPRE richiesto: usa 'tutti', mai lasciarlo vuoto o nullo."},
                 },
-                "required": [],
+                "required": ["tipo"],
             },
         },
     },
@@ -2708,11 +2708,13 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
         "mai NESSUNA_AZIONE a queste richieste. Una richiesta di creare una presentazione VA riconosciuta con "
         "crea_presentazione, sia che l'utente dica esplicitamente 'PowerPoint' o 'Google Slides'/'presentazione "
         "Google' (allora imposta il parametro 'formato' di conseguenza), sia che non specifichi il formato "
-        "(allora lascia 'formato' vuoto: sara' il tool stesso a chiederlo, non indovinarlo mai tu qui). Resta un "
+        "(allora imposta 'formato' su 'non_specificato': sara' il tool stesso a chiederlo, non indovinarlo mai tu "
+        "qui - NON lasciare mai questo campo vuoto o nullo, e' sempre richiesto un valore tra i tre validi). Resta un "
         "limite reale solo qualunque file su un servizio diverso da Google/PowerPoint. Una richiesta di VEDERE/"
         "ELENCARE i file Google gia' creati (es. 'che file hai creato', 'mostrami i fogli fatti') VA riconosciuta "
         "con mostra_file_google_creati, ma SOLO quando l'utente lo chiede esplicitamente lui - non chiamarlo mai "
-        "di tua iniziativa dopo aver creato un file. Una richiesta di salvare/aggiornare un ospite e le sue "
+        "di tua iniziativa dopo aver creato un file; se non specifica un tipo particolare, imposta 'tipo' su "
+        "'tutti' (mai vuoto o nullo, e' sempre richiesto). Una richiesta di salvare/aggiornare un ospite e le sue "
         "intolleranze/preferenze (es. 'Carlo non mangia i funghi', 'aggiungi Maria agli ospiti') VA riconosciuta "
         "con aggiungi_ospite; di vedere gli ospiti salvati con mostra_ospiti; di rimuoverne uno con "
         "rimuovi_ospite.\n"
