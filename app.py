@@ -76,6 +76,13 @@ GOOGLE_OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/documents",
+    # Round 23: aggiunto su richiesta esplicita di Massimo ("le voglio
+    # entrambe", riferito a PowerPoint scaricabile + Google Slides native).
+    # Come ogni scope nuovo aggiunto qui, non si applica da solo agli account
+    # gia' collegati in precedenza: serve un ricollegamento (disconnetti/
+    # ricollega in barra laterale) perche' il consenso lo includa davvero -
+    # stesso principio gia' documentato per spreadsheets/documents.
+    "https://www.googleapis.com/auth/presentations",
 ]
 
 # access_token/refresh_token sono piu' sensibili dei PIN/token "ricordami"
@@ -2339,12 +2346,13 @@ GOOGLE_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "crea_presentazione",
-            "description": "Crea davvero un file di presentazione (PowerPoint/Google Slides) scaricabile, con slide vere generate sull'argomento indicato. Usa questo per richieste come 'fammi una presentazione su...', 'crea delle slide su...', 'preparami un PowerPoint su...'. Non richiede un account Google collegato (non tocca Drive/Slides direttamente: crea un file .pptx scaricabile, importabile anche in Google Slides).",
+            "description": "Crea davvero una presentazione, con slide vere generate sull'argomento indicato, in uno di due formati REALI e distinti: un file PowerPoint scaricabile (non tocca Google), oppure una vera presentazione Google Slides nativa dentro Google Drive (richiede un account Google collegato con il permesso apposito). Usa questo per richieste come 'fammi una presentazione su...', 'crea delle slide su...', 'preparami un PowerPoint su...', 'fammi delle Google Slides su...'.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "titolo": {"type": "string", "description": "Titolo breve della presentazione."},
                     "argomento": {"type": "string", "description": "Di cosa deve parlare la presentazione: l'argomento e ogni indicazione utile data dall'utente su cosa includere."},
+                    "formato": {"type": "string", "enum": ["powerpoint", "slides_google"], "description": "Formato scelto DALL'UTENTE per il file: 'powerpoint' per un file .pptx scaricabile (non richiede Google), 'slides_google' per una vera presentazione Google Slides nativa (richiede account Google collegato). Imposta questo parametro SOLO se l'utente lo specifica esplicitamente (es. dice 'PowerPoint' o 'Google Slides'/'presentazione Google') - se non lo specifica, lascialo vuoto: verra' chiesto esplicitamente quale formato vuole, non va mai indovinato."},
                 },
                 "required": ["titolo", "argomento"],
             },
@@ -2538,12 +2546,15 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
     dismesso llama-3.3-70b-versatile), modello Groq con supporto affidabile
     per i tool personalizzati - non PRIMARY_MODEL ("groq/compound"), il cui
     comportamento con "tools" definiti da noi non e' documentato.
-    NOTA (round 20septies, valida anche per round 21 e round 22/22quater): "crea_presentazione",
-    "cerca_norma", "cerca_sentenza_costituzionale", "cerca_sentenza_cassazione",
-    "cerca_ricetta", "ricetta_salva_preferita", "ricetta_mostra_preferite",
-    "ricetta_feedback" e "ricetta_rimuovi_preferita" sono gli unici tool di questo
-    elenco che non servono un account Google - vivono comunque qui perche' e' lo
-    stesso classificatore a riconoscerli.
+    NOTA (round 20septies, valida anche per round 21 e round 22/22quater): "cerca_norma",
+    "cerca_sentenza_costituzionale", "cerca_sentenza_cassazione", "cerca_ricetta",
+    "ricetta_salva_preferita", "ricetta_mostra_preferite", "ricetta_feedback" e
+    "ricetta_rimuovi_preferita" sono tool di questo elenco che non servono mai un
+    account Google - vivono comunque qui perche' e' lo stesso classificatore a
+    riconoscerli. "crea_presentazione" (round 23) e' un caso a parte: non serve
+    Google per il formato "powerpoint", ma lo serve per "slides_google" - la
+    funzione che la gestisce fa da sola il proprio controllo di credenziali per
+    quel ramo, quindi resta comunque fuori dal controllo OAuth generico qui sotto.
     NOTA (round 23): "crea_foglio_google", "crea_documento_google" e
     "condividi_file_google" SERVONO invece un account Google (stesso scope
     gia' concesso per la lista della spesa: "spreadsheets"/"documents"/
@@ -2575,9 +2586,11 @@ def _classifica_intento_google(testo_completo, cronologia_recente, utente):
         "ATTENZIONE: una richiesta di creare un foglio di calcolo Google, un documento Google scritto (es. una "
         "lettera), o di condividere un file gia' creato, VA riconosciuta con crea_foglio_google/"
         "crea_documento_google/condividi_file_google (esistono davvero, non sono piu' un limite) - non rispondere "
-        "mai NESSUNA_AZIONE a queste richieste. Resta invece un limite reale una presentazione Google Slides "
-        "nativa (oggi si crea solo un file PowerPoint scaricabile con crea_presentazione, non ancora uno Slides "
-        "vero) e qualunque file su un servizio diverso da Google/PowerPoint.\n"
+        "mai NESSUNA_AZIONE a queste richieste. Una richiesta di creare una presentazione VA riconosciuta con "
+        "crea_presentazione, sia che l'utente dica esplicitamente 'PowerPoint' o 'Google Slides'/'presentazione "
+        "Google' (allora imposta il parametro 'formato' di conseguenza), sia che non specifichi il formato "
+        "(allora lascia 'formato' vuoto: sara' il tool stesso a chiederlo, non indovinarlo mai tu qui). Resta un "
+        "limite reale solo qualunque file su un servizio diverso da Google/PowerPoint.\n"
         "4. Non inventare MAI un indirizzo email, un nome file, un articolo o un argomento di presentazione che non "
         "compare nel messaggio o nella cronologia recente: se manca, chiedilo (regola 2).\n"
         "5. Per motivi di sicurezza, un indirizzo email per scrivere/rispondere a una mail viene accettato SOLO se "
@@ -2771,46 +2784,145 @@ def _crea_pptx_bytes(titolo, slides):
         return None
 
 
-def _gestisci_crea_presentazione(argomenti):
+def _crea_slides_google_reale(creds, titolo, slides):
+    """Crea davvero una presentazione Google Slides NATIVA (non un file
+    PowerPoint) con l'API Slides: una slide per ogni elemento di "slides"
+    (titolo + punti elenco). Gli object ID dei segnaposto vengono scelti da
+    noi al momento della creazione (placeholderIdMappings), cosi' il testo
+    puo' essere inserito nella STESSA chiamata batchUpdate che crea le slide
+    - mai una slide vuota lasciata a meta'. Ritorna l'ID della presentazione
+    creata (mai un ID inventato). NON cattura le eccezioni: e' il chiamante
+    (_gestisci_crea_presentazione) a distinguere un 403 di permessi mancanti
+    - da segnalare con il messaggio onesto di ricollegamento - da un errore
+    generico, esattamente come gia' fanno _gestisci_crea_foglio_google e
+    _gestisci_crea_documento_google (stesso pattern, non duplicato qui)."""
+    slides_service = google_build("slides", "v1", credentials=creds)
+    _presentazione = slides_service.presentations().create(body={"title": titolo}).execute()
+    _presentation_id = _presentazione["presentationId"]
+
+    _richieste = []
+    for _i, _s in enumerate(slides):
+        _slide_id, _title_id, _body_id = f"slide_{_i}", f"title_{_i}", f"body_{_i}"
+        _richieste.append({
+            "createSlide": {
+                "objectId": _slide_id,
+                "slideLayoutReference": {"predefinedLayout": "TITLE_AND_BODY"},
+                "placeholderIdMappings": [
+                    {"layoutPlaceholder": {"type": "TITLE", "index": 0}, "objectId": _title_id},
+                    {"layoutPlaceholder": {"type": "BODY", "index": 0}, "objectId": _body_id},
+                ],
+            }
+        })
+        _richieste.append({"insertText": {"objectId": _title_id, "text": _s["titolo"]}})
+        _richieste.append({"insertText": {"objectId": _body_id, "text": "\n".join(_s["punti"])}})
+
+    slides_service.presentations().batchUpdate(
+        presentationId=_presentation_id, body={"requests": _richieste},
+    ).execute()
+    return _presentation_id
+
+
+def _gestisci_crea_presentazione(argomenti, utente=None, testo_completo=""):
     """Orchestratore chiamato da _handle_google_agent_logic: genera il
-    contenuto, costruisce il file .pptx vero, lo carica su R2 e ritorna un
-    link di download reale. Non richiede alcun account Google collegato
-    (non e' un'azione Google, vive nello stesso elenco di tool solo perche'
-    e' li' che il classificatore d'intento gia' riconosce le richieste
-    dell'utente) - vedi il controllo dedicato in _handle_google_agent_logic
-    che la esegue PRIMA del controllo delle credenziali Google."""
+    contenuto (condiviso tra i due formati) e poi costruisce DAVVERO uno solo
+    dei due file reali possibili, scelto dall'utente (round 23, richiesta
+    esplicita di Massimo: "le voglio entrambe [...] rendilo scaricabile in
+    una sola versione dopo che l'utente ha scelto, quindi lo deve chiedere
+    come lo vogliamo" - mai i due formati insieme, sempre chiesto prima):
+    - "powerpoint": file .pptx caricato su R2, NON richiede alcun account
+      Google (percorso invariato dal round 20septies).
+    - "slides_google": vera presentazione Google Slides nativa via API,
+      richiede un account Google collegato con lo scope "presentations" -
+      se manca (account non ancora ricollegato dopo che lo scope e' stato
+      aggiunto), stesso messaggio onesto di ricollegamento gia' usato per
+      Fogli/Documenti liberi, mai un file finto."""
     _titolo = (argomenti.get("titolo") or "").strip() or "Presentazione"
     _argomento = (argomenti.get("argomento") or "").strip()
     if not _argomento:
         return "Dimmi anche di cosa deve parlare la presentazione, cosi' preparo i contenuti."
 
-    if not _r2_enabled():
+    _formato = (argomenti.get("formato") or "").strip().lower()
+    if _formato not in ("powerpoint", "slides_google"):
         return (
-            "Posso preparare i contenuti della presentazione, ma non posso ancora salvarla come file scaricabile "
-            "perche' lo spazio di archiviazione non e' configurato su questo server. Vuoi che te ne scriva qui il "
-            "contenuto da copiare?"
+            "Vuoi un file PowerPoint scaricabile (funziona subito, si apre ovunque) oppure una vera presentazione "
+            "Google Slides nativa dentro Google Drive? Dimmi quale dei due preferisci."
         )
+
+    if _formato == "powerpoint":
+        if not _r2_enabled():
+            return (
+                "Posso preparare i contenuti della presentazione, ma non posso ancora salvarla come file scaricabile "
+                "perche' lo spazio di archiviazione non e' configurato su questo server. Vuoi che te ne scriva qui il "
+                "contenuto da copiare?"
+            )
+        _slides = _genera_contenuto_presentazione(_titolo, _argomento)
+        if not _slides:
+            return "Non sono riuscito a generare il contenuto della presentazione in questo momento: riprova tra poco."
+        _pptx_bytes = _crea_pptx_bytes(_titolo, _slides)
+        if not _pptx_bytes:
+            return "Ho preparato i contenuti ma non sono riuscito a creare il file della presentazione: riprova tra poco."
+        _nome_file_sicuro = re.sub(r"[^A-Za-z0-9 _-]", "", _titolo).strip().replace(" ", "_") or "presentazione"
+        _link = r2_upload(_pptx_bytes, f"{_nome_file_sicuro}.pptx", R2_BUCKET_ALLEGATI, R2_PUBLIC_URL_ALLEGATI)
+        if not _link:
+            return "Ho creato la presentazione ma non sono riuscito a salvarla in modo da poterla scaricare: riprova tra poco."
+        _elenco_slide = "\n".join(f"- {s['titolo']}" for s in _slides)
+        return (
+            f"✅ Presentazione PowerPoint pronta: {_link}\n\n"
+            f"Contiene {len(_slides)} slide di contenuto (oltre a quella di apertura):\n{_elenco_slide}\n\n"
+            "E' un file .pptx: si apre con PowerPoint, oppure si puo' importare in Google Slides da Google Drive → "
+            "Nuovo → Importa file."
+        )
+
+    # _formato == "slides_google": richiede davvero un account Google.
+    if not _google_oauth_enabled():
+        return "La connessione con Google non e' ancora configurata su questo server."
+    _conn_type, _conn_user_id = _scegli_connessione_google(utente or {}, testo_completo)
+    if not _conn_type:
+        return (
+            "Non risulta ancora nessun account Google collegato (ne' il tuo personale ne' quello di famiglia). "
+            "Puoi collegarlo dalla barra laterale, sezione \"Collegamenti Google\"."
+        )
+    _creds = _get_google_credentials(_conn_type, _conn_user_id)
+    if not _creds:
+        return "Non riesco ad accedere al tuo account Google in questo momento: prova a ricollegarlo dalla barra laterale."
 
     _slides = _genera_contenuto_presentazione(_titolo, _argomento)
     if not _slides:
         return "Non sono riuscito a generare il contenuto della presentazione in questo momento: riprova tra poco."
 
-    _pptx_bytes = _crea_pptx_bytes(_titolo, _slides)
-    if not _pptx_bytes:
-        return "Ho preparato i contenuti ma non sono riuscito a creare il file della presentazione: riprova tra poco."
-
-    _nome_file_sicuro = re.sub(r"[^A-Za-z0-9 _-]", "", _titolo).strip().replace(" ", "_") or "presentazione"
-    _link = r2_upload(_pptx_bytes, f"{_nome_file_sicuro}.pptx", R2_BUCKET_ALLEGATI, R2_PUBLIC_URL_ALLEGATI)
-    if not _link:
-        return "Ho creato la presentazione ma non sono riuscito a salvarla in modo da poterla scaricare: riprova tra poco."
+    try:
+        _presentation_id = _crea_slides_google_reale(_creds, _titolo, _slides)
+    except GoogleHttpError as e:
+        if getattr(e, "status_code", None) == 403 or " 403" in str(e) or "insufficient" in str(e).lower():
+            return (
+                "Per creare presentazioni Google Slides serve un permesso che il tuo collegamento attuale non ha "
+                "ancora: vai in barra laterale, sezione \"Collegamenti Google\", disconnetti e ricollega il tuo "
+                "account per concederlo."
+            )
+        print(f"[presentazione_slides] creazione fallita: {e}", flush=True)
+        return "Non sono riuscito a creare la presentazione Google Slides in questo momento: riprova tra poco."
+    except Exception as e:
+        print(f"[presentazione_slides] creazione fallita: {type(e).__name__}: {e}", flush=True)
+        return "Non sono riuscito a creare la presentazione Google Slides in questo momento: riprova tra poco."
+    if not _presentation_id:
+        return "Non sono riuscito a creare la presentazione Google Slides in questo momento: riprova tra poco."
 
     _elenco_slide = "\n".join(f"- {s['titolo']}" for s in _slides)
-    return (
-        f"✅ Presentazione pronta: {_link}\n\n"
-        f"Contiene {len(_slides)} slide di contenuto (oltre a quella di apertura):\n{_elenco_slide}\n\n"
-        "E' un file .pptx: si apre con PowerPoint, oppure si puo' importare in Google Slides da Google Drive → "
-        "Nuovo → Importa file."
+    _link_modifica = f"https://docs.google.com/presentation/d/{_presentation_id}/edit"
+    _nome_file_sicuro = re.sub(r"[^A-Za-z0-9 _-]", "", _titolo).strip().replace(" ", "_") or "presentazione"
+    _link_download = _esporta_e_carica_r2(
+        _creds, _presentation_id,
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx", _nome_file_sicuro,
     )
+    _registra_file_google_creato(_conn_type, _conn_user_id, (utente or {}).get("id"), _presentation_id, "presentazione", _titolo, _link_download)
+
+    _msg = f"✅ Ho creato davvero la presentazione Google Slides \"{_titolo}\".\n"
+    _msg += f"Contiene {len(_slides)} slide di contenuto (oltre a quella di apertura):\n{_elenco_slide}\n\n"
+    _msg += f"✏️ Apri e modifica su Google Drive: {_link_modifica}\n"
+    if _link_download:
+        _msg += f"📥 Scaricala anche direttamente qui: {_link_download}\n"
+    _msg += "Vuoi che la condivida anche su Google Drive con qualcuno? Dimmi l'indirizzo email."
+    return _msg
 
 
 # --- Ricerca giuridica (round 21, richiesta esplicita dell'utente) --------
@@ -3686,14 +3798,18 @@ def _handle_google_agent_logic(azione_nome, argomenti, utente, testo_completo):
     # sarebbe stato piu' fragile che tenerle separate cosi'.
     argomenti = argomenti or {}
 
-    # "crea_presentazione" (round 20septies), "cerca_norma" /
-    # "cerca_sentenza_costituzionale" / "cerca_sentenza_cassazione" (round
-    # 21) e le quattro azioni sulle ricette (round 22) sono le uniche azioni
-    # di questo elenco che NON toccano Google: vanno gestite PRIMA del
-    # controllo OAuth/credenziali qui sotto, altrimenti fallirebbero a
-    # chiedere un collegamento Google che non gli serve affatto.
+    # "crea_presentazione" (round 20septies; round 23: puo' ORA toccare
+    # Google se l'utente sceglie "slides_google", ma la funzione gestisce da
+    # sola il proprio controllo OAuth/credenziali al suo interno per quel
+    # ramo - per il ramo "powerpoint" non serve Google affatto, quindi resta
+    # comunque corretto gestirla qui, prima del controllo generico sotto),
+    # "cerca_norma" / "cerca_sentenza_costituzionale" /
+    # "cerca_sentenza_cassazione" (round 21) e le quattro azioni sulle
+    # ricette (round 22) sono le uniche azioni di questo elenco gestite
+    # PRIMA del controllo OAuth/credenziali generico qui sotto (le altre lo
+    # richiedono sempre, queste no o lo gestiscono da sole).
     if azione_nome == "crea_presentazione":
-        return _gestisci_crea_presentazione(argomenti)
+        return _gestisci_crea_presentazione(argomenti, utente, testo_completo)
     if azione_nome == "cerca_norma":
         return _gestisci_cerca_norma(argomenti)
     if azione_nome == "cerca_sentenza_costituzionale":
@@ -3928,14 +4044,14 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "email Gmail, lista della spesa su un foglio Google dedicato - SOLO quella lista, nessun altro contenuto "
         "puo' finire li' dentro - verbali audio con Google Doc + promemoria, creazione libera di Fogli e Documenti "
         "Google veri con qualunque contenuto richiesto (vedi dettaglio esatto sotto), creazione di presentazioni "
-        "PowerPoint scaricabili con contenuto vero, ricerca vera di norme/leggi su Normattiva, link di ricerca "
-        "reali per sentenze della Corte Costituzionale e della Cassazione, ricerca vera di ricette di cucina con "
-        "ingredienti/procedimento reali tradotti in italiano e catalogo delle ricette preferite) - se stai "
-        "rispondendo tu in questa chat generica, quei comandi non si sono attivati (puo' "
+        "sia PowerPoint scaricabili sia Google Slides native vere (vedi dettaglio esatto sotto - l'app chiede "
+        "sempre quale dei due formati l'utente vuole, mai indovinato), ricerca vera di norme/leggi su Normattiva, "
+        "link di ricerca reali per sentenze della Corte Costituzionale e della Cassazione, ricerca vera di "
+        "ricette di cucina con ingredienti/procedimento reali tradotti in italiano e catalogo delle ricette "
+        "preferite) - se stai rispondendo tu in questa chat generica, quei comandi non si sono attivati (puo' "
         "succedere anche se manca l'argomento/la query: in quel caso il comando dedicato avrebbe gia' chiesto il "
         "dettaglio mancante, quindi fallo anche tu). Se l'utente chiede qualcosa che non sai davvero fare "
-        "(oggi, l'unico limite reale rimasto su Google e' una presentazione Google Slides NATIVA - quella esiste "
-        "solo come file PowerPoint scaricabile - e qualunque file su un servizio diverso da Google/PowerPoint), "
+        "(oggi, l'unico limite reale rimasto e' qualunque file su un servizio diverso da Google/PowerPoint), "
         "NON DEVI MAI: inventare un link (docs.google.com, drive.google.com o qualsiasi URL), "
         "descrivere un'azione come gia' avvenuta ('ho creato...', 'ho salvato...', 'ecco il link...') se non "
         "l'hai davvero fatta, dare istruzioni che presuppongono l'esistenza di un file che non esiste, NE' "
@@ -3954,8 +4070,15 @@ def build_api_messages(history, knowledge_text, history_limit=None, char_limit=N
         "su Google, arriva SEMPRE anche un link di download diretto in chat (non serve andare su Drive per "
         "scaricarlo). La condivisione del file su Google Drive con un indirizzo email NON e' mai automatica: "
         "avviene solo se l'utente la chiede esplicitamente dicendo l'indirizzo per esteso, e riguarda l'ultimo "
-        "file creato (o quello indicato per titolo). Resta vero, e va detto se chiesto, che una presentazione "
-        "Google Slides nativa non esiste ancora - solo un file PowerPoint scaricabile."
+        "file creato (o quello indicato per titolo)."
+        "\n\nDETTAGLIO ESATTO SULLE PRESENTAZIONI (round 23, obbligatorio se ti viene chiesto cosa sai fare con le "
+        "presentazioni - descrivi SOLO questo, MAI un limite ormai superato): l'app crea DAVVERO presentazioni in "
+        "due formati reali, e chiede sempre all'utente quale dei due preferisce prima di crearla (mai indovinato, "
+        "mai creati entrambi insieme) - 'PowerPoint' per un file .pptx scaricabile subito, che non richiede alcun "
+        "account Google; oppure 'Google Slides' per una vera presentazione nativa dentro Google Drive (richiede "
+        "un account Google collegato), modificabile online, con anche una copia .pptx scaricabile in chat. In "
+        "entrambi i casi il contenuto (slide, titoli, punti elenco) e' generato davvero in base all'argomento "
+        "richiesto, mai una struttura vuota o placeholder."
         "\n\nDETTAGLIO ESATTO SUL CATALOGO DELLE RICETTE PREFERITE (obbligatorio se ti viene chiesto cosa sai fare "
         "con le ricette, o qualcosa sul catalogo/preferite - descrivi SOLO questo, MAI un'alternativa inventata, "
         "NEMMENO per sembrare piu' prudente o onesto - qui sotto NON e' una capacita' vietata, e' una capacita' "
@@ -4410,6 +4533,15 @@ st.markdown(f"""
    (la connessione locale e' troppo veloce perche' compaia). */
 [data-testid="stDecoration"],
 #stDecoration {{
+    display: none !important;
+}}
+/* Icona/etichetta "In esecuzione..." + pulsante Stop che Streamlit mostra in
+   alto a destra durante l'esecuzione dello script (nativa di Streamlit, non
+   nostra) - segnalata da Massimo (round 23) come un'iconcina che sembra una
+   "sedia a rotelle" durante il caricamento: rimossa per lo stesso motivo
+   della barra colorata qui sopra, e per lo stesso testid usato dalle
+   versioni recenti di Streamlit per questo elemento. */
+[data-testid="stStatusWidget"] {{
     display: none !important;
 }}
 /* Spazio di sicurezza per la barra di stato del telefono (notch, isola
@@ -4941,7 +5073,15 @@ if st.session_state.get("just_logged_in"):
     """, unsafe_allow_html=True)
     _col1, _col2, _col3 = st.columns([1, 2, 1])
     with _col2:
-        if st.button("Entra nella chat →", use_container_width=True, type="primary"):
+        # key esplicita (round 23, segnalazione di Massimo: a volte vedeva
+        # due bottoni "Entra nella chat" sovrapposti) - senza una key fissa,
+        # Streamlit assegna un identificativo automatico al widget che puo'
+        # cambiare tra un re-render e l'altro durante la sequenza di reload
+        # automatico del "Ricordami" (vedi sopra), rischiando di far
+        # comparire per un istante due istanze dello stesso bottone durante
+        # la transizione. Una key fissa mantiene la stessa identita' del
+        # widget in ogni re-render.
+        if st.button("Entra nella chat →", use_container_width=True, type="primary", key="btn_entra_chat_welcome"):
             st.session_state.just_logged_in = False
             # Ogni ingresso in chat riparte da una conversazione nuova e vuota:
             # quelle precedenti restano salvate e consultabili dalla barra
